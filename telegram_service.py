@@ -769,10 +769,10 @@ def get_numeric_button_set(buttons: List[Dict[str, Any]]) -> List[int]:
 
 def _pick_next_page_button(callback_msg: Dict[str, Any], next_keywords: List[str]) -> Tuple[Optional[Dict[str, Any]], str]:
     """
-    依照新規則：
-    - 不使用「下一頁/➡️」等文字關鍵字判斷
-    - 不做任何 fallback（不會猜按 2、不會按上一頁、不會送文字）
-    - 只有在「頁碼按鈕存在」且「可辨識目前頁碼」時，才會按「目前頁碼 + 1」
+    分頁按鈕挑選規則：
+    1) 若存在「頁碼按鈕」，維持原邏輯：只按「目前頁碼 + 1」
+    2) 若沒有任何頁碼按鈕（例如只剩「下一页 ➡️」這種），才改用 next_keywords 來找「下一頁」按鈕
+       （不影響原本有頁碼的 bot）
     """
     if not callback_msg:
         return None, "no_callback_msg"
@@ -782,47 +782,126 @@ def _pick_next_page_button(callback_msg: Dict[str, Any], next_keywords: List[str
         return None, "no_buttons"
 
     numeric_pages = get_numeric_button_set(buttons)
-    if not numeric_pages:
-        return None, "no_page_numbers"
 
-    pi = extract_page_info(callback_msg.get("text"))
-    highlighted = detect_current_page_from_buttons(buttons)
+    # === 原有 bot：有頁碼按鈕，就完全沿用「頁碼 + 1」邏輯 ===
+    if numeric_pages:
+        pi = extract_page_info(callback_msg.get("text"))
+        highlighted = detect_current_page_from_buttons(buttons)
 
-    cur_guess: Optional[int] = None
-    if highlighted is not None:
-        try:
-            cur_guess = int(highlighted)
-        except Exception:
-            cur_guess = None
+        cur_guess: Optional[int] = None
+        if highlighted is not None:
+            try:
+                cur_guess = int(highlighted)
+            except Exception:
+                cur_guess = None
 
-    if cur_guess is None and pi and pi.get("current_page") is not None:
-        try:
-            cur_guess = int(pi.get("current_page"))
-        except Exception:
-            cur_guess = None
+        if cur_guess is None and pi and pi.get("current_page") is not None:
+            try:
+                cur_guess = int(pi.get("current_page"))
+            except Exception:
+                cur_guess = None
 
-    if cur_guess is None:
-        return None, "cannot_detect_current_page"
+        if cur_guess is None:
+            return None, "cannot_detect_current_page"
 
-    # 若文字頁碼資訊可判斷已到最後一頁，直接停
-    if pi and pi.get("total_pages") is not None:
-        try:
-            total_pages = int(pi.get("total_pages"))
-            if cur_guess >= total_pages:
-                return None, "already_last_page"
+        # 若文字頁碼資訊可判斷已到最後一頁，直接停
+        if pi and pi.get("total_pages") is not None:
+            try:
+                total_pages = int(pi.get("total_pages"))
+                if cur_guess >= total_pages:
+                    return None, "already_last_page"
+                want = cur_guess + 1
+                if want > total_pages:
+                    return None, "already_last_page"
+            except Exception:
+                want = cur_guess + 1
+        else:
             want = cur_guess + 1
-            if want > total_pages:
-                return None, "already_last_page"
-        except Exception:
-            want = cur_guess + 1
-    else:
-        want = cur_guess + 1
 
-    btn_plus_one = pick_button_by_page_number(callback_msg, want)
-    if not btn_plus_one:
-        return None, "no_next_page_number_button"
+        btn_plus_one = pick_button_by_page_number(callback_msg, want)
+        if not btn_plus_one:
+            return None, "no_next_page_number_button"
 
-    return btn_plus_one, "numeric_plus_one"
+        return btn_plus_one, "numeric_plus_one"
+
+    # === 新 bot：沒有頁碼按鈕（只有「下一頁」類型按鈕） ===
+    kws: List[str] = []
+    if next_keywords:
+        for kw in next_keywords:
+            kw2 = str(kw or "").strip()
+            if not kw2:
+                continue
+            if kw2 not in kws:
+                kws.append(kw2)
+
+    if not kws:
+        kws = [
+            "下一頁", "下页", "下一页",
+            "Next", "next",
+            ">", ">>", "»", "›", "»»",
+            "▶", "►", "⏩", "→", "➡", "➡️",
+            "⏭", "⏭️",
+            "更多", "more", "More",
+            "Forward", "forward"
+        ]
+
+    prev_markers = [
+        "上一頁", "上一页",
+        "prev", "previous", "back", "return",
+        "返回", "回到",
+        "◀", "⬅", "⏮", "⏪",
+        "«", "‹",
+        "<<", "<"
+    ]
+
+    best_btn: Optional[Dict[str, Any]] = None
+    best_score = -10_000_000
+
+    for b in buttons:
+        t_raw = str(b.get("text") or "").strip()
+        if not t_raw:
+            continue
+
+        t_norm = _normalize_button_text(t_raw)
+        if not t_norm:
+            continue
+
+        is_prev = False
+        for pm in prev_markers:
+            pm_norm = _normalize_button_text(pm)
+            if pm_norm and pm_norm in t_norm:
+                is_prev = True
+                break
+        if is_prev:
+            continue
+
+        score = 0
+        for kw in kws:
+            kw_norm = _normalize_button_text(kw)
+            if kw_norm and kw_norm in t_norm:
+                score = score + 50
+
+                if kw_norm in ["下一頁", "下一页", "下页", "next", "forward"]:
+                    score = score + 20
+                if kw_norm in ["➡", "➡️", "→", "⏭", "⏭️", "▶", "►", "⏩"]:
+                    score = score + 12
+
+        if score <= 0:
+            continue
+
+        if ("➡" in t_raw) or ("→" in t_raw) or ("⏭" in t_raw) or ("⏭️" in t_raw) or ("▶" in t_raw) or ("»" in t_raw):
+            score = score + 8
+
+        score = score + min(len(t_raw), 60)
+
+        if best_btn is None or score > best_score:
+            best_btn = b
+            best_score = score
+
+    if best_btn:
+        return best_btn, "next_keyword"
+
+    return None, "no_page_numbers"
 
 def _pagination_confirmed_all_pages_visited(state: Optional[Dict[str, Any]], visited_pages: Any) -> bool:
     if not state:
