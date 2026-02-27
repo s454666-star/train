@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenv
+venv/
+.env/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+
+# Session
+session/
+
+# Generated
+generated/
+
+# Executables
+*.exe
+
+# Windows
+Thumbs.db
+
+.env
