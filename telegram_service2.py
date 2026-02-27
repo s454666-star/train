@@ -116,8 +116,12 @@ def _invalid_key(bot_username: str, chat_id: int, message_id: int) -> str:
     return f"{bot_username}|{chat_id}|{message_id}"
 
 
-def _action_key(bot_username: str, chat_id: int, message_id: int, data_hex: str) -> str:
-    return f"{bot_username}|{chat_id}|{message_id}|{data_hex}"
+def _action_key(bot_username: str, chat_id: int, message_id: int, data_hex: str, marker: Optional[str] = None) -> str:
+    base = f"{bot_username}|{chat_id}|{message_id}|{data_hex}"
+    mk = str(marker or "").strip()
+    if not mk:
+        return base
+    return f"{base}|{mk}"
 
 
 def mark_invalid_callback(bot_username: str, chat_id: int, message_id: int):
@@ -132,15 +136,15 @@ def is_invalid_callback(bot_username: str, chat_id: int, message_id: int) -> boo
     return k in INVALID_CALLBACK_MIDS
 
 
-def mark_recent_used_callback_action(bot_username: str, chat_id: int, message_id: int, data_hex: str):
+def mark_recent_used_callback_action(bot_username: str, chat_id: int, message_id: int, data_hex: str, marker: Optional[str] = None):
     _cleanup_recent_used_callback_cache()
-    k = _action_key(bot_username, chat_id, message_id, data_hex)
+    k = _action_key(bot_username, chat_id, message_id, data_hex, marker=marker)
     RECENT_USED_CALLBACK_ACTIONS[k] = _now_s()
 
 
-def unmark_recent_used_callback_action(bot_username: str, chat_id: int, message_id: int, data_hex: str):
+def unmark_recent_used_callback_action(bot_username: str, chat_id: int, message_id: int, data_hex: str, marker: Optional[str] = None):
     _cleanup_recent_used_callback_cache()
-    k = _action_key(bot_username, chat_id, message_id, data_hex)
+    k = _action_key(bot_username, chat_id, message_id, data_hex, marker=marker)
     try:
         if k in RECENT_USED_CALLBACK_ACTIONS:
             del RECENT_USED_CALLBACK_ACTIONS[k]
@@ -148,9 +152,9 @@ def unmark_recent_used_callback_action(bot_username: str, chat_id: int, message_
         pass
 
 
-def is_recent_used_callback_action(bot_username: str, chat_id: int, message_id: int, data_hex: str) -> bool:
+def is_recent_used_callback_action(bot_username: str, chat_id: int, message_id: int, data_hex: str, marker: Optional[str] = None) -> bool:
     _cleanup_recent_used_callback_cache()
-    k = _action_key(bot_username, chat_id, message_id, data_hex)
+    k = _action_key(bot_username, chat_id, message_id, data_hex, marker=marker)
     return k in RECENT_USED_CALLBACK_ACTIONS
 
 
@@ -767,12 +771,79 @@ def get_numeric_button_set(buttons: List[Dict[str, Any]]) -> List[int]:
             nums.append(int(n))
     return sorted(set(nums))
 
+
+def _pagination_action_marker_from_message(callback_msg: Dict[str, Any], buttons: Optional[List[Dict[str, Any]]] = None) -> str:
+    if not callback_msg:
+        return ""
+
+    if buttons is None:
+        try:
+            buttons = get_callback_buttons(callback_msg)
+        except Exception:
+            buttons = []
+
+    pi = None
+    try:
+        pi = extract_page_info(callback_msg.get("text"))
+    except Exception:
+        pi = None
+
+    highlighted = None
+    try:
+        highlighted = detect_current_page_from_buttons(buttons) if buttons else None
+    except Exception:
+        highlighted = None
+
+    cur = None
+    total = None
+
+    if highlighted is not None:
+        cur = highlighted
+
+    if cur is None and pi and pi.get("current_page") is not None:
+        cur = pi.get("current_page")
+
+    if pi and pi.get("total_pages") is not None:
+        total = pi.get("total_pages")
+
+    # 若抓不到頁碼，改用訊息 fingerprint 產生 marker（避免 next-only bot data 固定導致被 recent_used 擋住）
+    if cur is None:
+        try:
+            import hashlib as _hashlib
+            fp = callback_fingerprint(callback_msg)
+            h = _hashlib.sha1(fp.encode("utf-8", errors="ignore")).hexdigest()[:12]
+            return f"fp={h}"
+        except Exception:
+            return "fp=unknown"
+
+    cur_i = None
+    try:
+        cur_i = int(cur)
+    except Exception:
+        cur_i = None
+
+    total_i = None
+    if total is not None:
+        try:
+            total_i = int(total)
+        except Exception:
+            total_i = None
+
+    if cur_i is not None and total_i is not None:
+        return f"p={cur_i}/{total_i}"
+
+    if cur_i is not None:
+        return f"p={cur_i}"
+
+    return f"p={cur}"
+
+
 def _pick_next_page_button(callback_msg: Dict[str, Any], next_keywords: List[str]) -> Tuple[Optional[Dict[str, Any]], str]:
     """
-    依照新規則：
-    - 不使用「下一頁/➡️」等文字關鍵字判斷
-    - 不做任何 fallback（不會猜按 2、不會按上一頁、不會送文字）
-    - 只有在「頁碼按鈕存在」且「可辨識目前頁碼」時，才會按「目前頁碼 + 1」
+    分頁按鈕選擇邏輯（保持原有「頁碼 + 1」行為不變，並額外支援只有「下一頁」按鈕的 bot）：
+
+    1) 若存在可解析的頁碼按鈕：優先按「目前頁碼 + 1」
+    2) 否則（或找不到 +1 按鈕）：嘗試按「下一頁/Next/➡️」等 next 按鈕
     """
     if not callback_msg:
         return None, "no_callback_msg"
@@ -781,48 +852,92 @@ def _pick_next_page_button(callback_msg: Dict[str, Any], next_keywords: List[str
     if not buttons:
         return None, "no_buttons"
 
-    numeric_pages = get_numeric_button_set(buttons)
-    if not numeric_pages:
-        return None, "no_page_numbers"
-
     pi = extract_page_info(callback_msg.get("text"))
-    highlighted = detect_current_page_from_buttons(buttons)
+    highlighted = None
+    try:
+        highlighted = detect_current_page_from_buttons(buttons)
+    except Exception:
+        highlighted = None
 
-    cur_guess: Optional[int] = None
-    if highlighted is not None:
-        try:
-            cur_guess = int(highlighted)
-        except Exception:
-            cur_guess = None
+    numeric_pages = get_numeric_button_set(buttons)
 
-    if cur_guess is None and pi and pi.get("current_page") is not None:
-        try:
-            cur_guess = int(pi.get("current_page"))
-        except Exception:
-            cur_guess = None
+    # A) 有頁碼按鈕：維持原本「目前頁碼 + 1」優先
+    if numeric_pages:
+        cur_guess: Optional[int] = None
 
-    if cur_guess is None:
-        return None, "cannot_detect_current_page"
+        if highlighted is not None:
+            try:
+                cur_guess = int(highlighted)
+            except Exception:
+                cur_guess = None
 
-    # 若文字頁碼資訊可判斷已到最後一頁，直接停
-    if pi and pi.get("total_pages") is not None:
-        try:
-            total_pages = int(pi.get("total_pages"))
-            if cur_guess >= total_pages:
-                return None, "already_last_page"
+        if cur_guess is None and pi and pi.get("current_page") is not None:
+            try:
+                cur_guess = int(pi.get("current_page"))
+            except Exception:
+                cur_guess = None
+
+        if cur_guess is None:
+            return None, "cannot_detect_current_page"
+
+        # 若文字頁碼資訊可判斷已到最後一頁，直接停
+        if pi and pi.get("total_pages") is not None:
+            try:
+                total_pages = int(pi.get("total_pages"))
+                if cur_guess >= total_pages:
+                    return None, "already_last_page"
+                want = cur_guess + 1
+                if want > total_pages:
+                    return None, "already_last_page"
+            except Exception:
+                want = cur_guess + 1
+        else:
             want = cur_guess + 1
-            if want > total_pages:
-                return None, "already_last_page"
-        except Exception:
-            want = cur_guess + 1
-    else:
-        want = cur_guess + 1
 
-    btn_plus_one = pick_button_by_page_number(callback_msg, want)
-    if not btn_plus_one:
+        btn_plus_one = pick_button_by_page_number(callback_msg, want)
+        if btn_plus_one:
+            return btn_plus_one, "numeric_plus_one"
+
+        # 找不到 +1 的頁碼按鈕時，再嘗試 next 按鈕（不影響原本可正常按頁碼的 bot）
+        # 例如頁碼按鈕是區間滾動，下一頁不一定在可見頁碼集合內
+
+    # B) next 按鈕（下一頁/Next/➡️...）
+    effective_kws: List[str] = []
+    for kw in (next_keywords or []):
+        kw2 = str(kw or "").strip()
+        if not kw2:
+            continue
+        if kw2 not in effective_kws:
+            effective_kws.append(kw2)
+
+    best_btn = None
+    best_kw_idx = 10 ** 9
+    best_btn_idx = 10 ** 9
+
+    for bi, b in enumerate(buttons):
+        t = _normalize_button_text(b.get("text") or "")
+        if not t:
+            continue
+
+        for ki, kw in enumerate(effective_kws):
+            kw_norm = _normalize_button_text(kw)
+            if not kw_norm:
+                continue
+            if kw_norm in t:
+                if ki < best_kw_idx or (ki == best_kw_idx and bi < best_btn_idx):
+                    best_btn = b
+                    best_kw_idx = ki
+                    best_btn_idx = bi
+                break
+
+    if best_btn:
+        return best_btn, "next_keyword"
+
+    if numeric_pages:
         return None, "no_next_page_number_button"
 
-    return btn_plus_one, "numeric_plus_one"
+    return None, "no_next_button"
+
 
 def _pagination_confirmed_all_pages_visited(state: Optional[Dict[str, Any]], visited_pages: Any) -> bool:
     if not state:
@@ -1434,7 +1549,18 @@ async def click_callback(bot_username: str, chat_id: int, message_id: int, data_
         push_log(stage="click_callback", result="no_peer", extra={"bot_username": bot_username, "chat_id": chat_id, "message_id": message_id})
         raise RuntimeError("no peer resolved for bot_username")
 
-    await client(GetBotCallbackAnswerRequest(peer=peer, msg_id=message_id, data=bytes.fromhex(data_hex)))
+    try:
+        await client(GetBotCallbackAnswerRequest(peer=peer, msg_id=message_id, data=bytes.fromhex(data_hex)))
+    except FloodWaitError as e:
+        wait_s = 0
+        try:
+            wait_s = int(getattr(e, "seconds", 0) or 0)
+        except Exception:
+            wait_s = 0
+        push_log(stage="click_callback", result="flood_wait", extra={"bot_username": bot_username, "chat_id": chat_id, "message_id": message_id, "wait_seconds": wait_s})
+        if wait_s > 0:
+            await asyncio.sleep(float(wait_s) + 1.0)
+        await client(GetBotCallbackAnswerRequest(peer=peer, msg_id=message_id, data=bytes.fromhex(data_hex)))
 
 
 async def _delete_messages_in_batches(bot_username: str, message_ids: List[int], revoke: bool = True):
@@ -1891,8 +2017,8 @@ async def _wait_for_files_or_state_change(
     step: int = 0
 ) -> Tuple[bool, str]:
     start = time.time()
-    last_unique_count = 0
 
+    baseline_unique = 0
     try:
         meta0 = collect_files_from_store(
             bot_username,
@@ -1900,39 +2026,109 @@ async def _wait_for_files_or_state_change(
             max_raw_payload_bytes=0,
             min_message_id=min_message_id
         )
-        last_unique_count = int(meta0.get("files_unique_count", meta0.get("files_count", 0)) or 0)
+        baseline_unique = int(meta0.get("files_unique_count", meta0.get("files_count", 0)) or 0)
     except Exception:
-        last_unique_count = 0
+        baseline_unique = 0
+
+    prev_msg = None
+    try:
+        for m in MESSAGE_STORE.values():
+            if m.get("sender_username") != bot_username:
+                continue
+            if int(m.get("message_id", 0) or 0) == int(prev_state_msg_id or 0):
+                prev_msg = m
+                break
+    except Exception:
+        prev_msg = None
+
+    prev_fp = callback_fingerprint(prev_msg) if prev_msg else ""
+    prev_text_preview = ((prev_msg.get("text") or "")[:260]) if prev_msg else ""
+    prev_pi = None
+    try:
+        prev_pi = extract_page_info(prev_msg.get("text")) if prev_msg else None
+    except Exception:
+        prev_pi = None
+
+    watch_next_keywords = [
+        "下一頁", "下一页", "下頁", "下页",
+        "Next", "next",
+        ">", ">>", "»", "›", "»»",
+        "▶", "►", "⏩", "→", "➡", "➡️",
+        "⏭", "⏭️",
+        "更多", "more", "More",
+        "Forward", "forward"
+    ]
 
     while True:
         if time.time() - start >= float(timeout_seconds or 0):
             return False, "timeout"
 
-        await backfill_latest_from_bot(bot_username, limit=300, timeout_seconds=6.0, max_logs=max_logs, step=step, min_message_id=int(min_message_id or 0))
-
-        files_meta = collect_files_from_store(
+        await backfill_latest_from_bot(
             bot_username,
-            max_return_files=0,
-            max_raw_payload_bytes=0,
-            min_message_id=min_message_id
+            limit=300,
+            timeout_seconds=6.0,
+            max_logs=max_logs,
+            step=step,
+            min_message_id=int(min_message_id or 0)
         )
-        files_unique_count = int(files_meta.get("files_unique_count", files_meta.get("files_count", 0)) or 0)
 
-        if files_unique_count > last_unique_count:
+        try:
+            files_meta = collect_files_from_store(
+                bot_username,
+                max_return_files=0,
+                max_raw_payload_bytes=0,
+                min_message_id=min_message_id
+            )
+            files_unique_count = int(files_meta.get("files_unique_count", files_meta.get("files_count", 0)) or 0)
+        except Exception:
+            files_unique_count = baseline_unique
+
+        if files_unique_count > baseline_unique:
             return True, "files_increased"
 
         new_cb = find_latest_pagination_callback_message(
             bot_username,
-            next_keywords=["下一頁", "下页", "Next", "next", ">", "»", "›"],
+            next_keywords=watch_next_keywords,
             skip_invalid=True,
             min_message_id=int(min_message_id or 0)
         )
+
         if new_cb:
             mid = int(new_cb.get("message_id") or 0)
+
             if mid and mid != int(prev_state_msg_id or 0):
                 return True, "state_changed"
 
+            # 很多 bot 是「編輯同一則訊息」來更新頁碼（message_id 不變）
+            if mid and mid == int(prev_state_msg_id or 0):
+                fp2 = ""
+                try:
+                    fp2 = callback_fingerprint(new_cb)
+                except Exception:
+                    fp2 = ""
+
+                if prev_fp and fp2 and fp2 != prev_fp:
+                    return True, "state_edited"
+
+                tp2 = (new_cb.get("text") or "")[:260]
+                if prev_text_preview and tp2 and tp2 != prev_text_preview:
+                    return True, "state_edited"
+
+                pi2 = None
+                try:
+                    pi2 = extract_page_info(new_cb.get("text"))
+                except Exception:
+                    pi2 = None
+
+                if prev_pi and pi2:
+                    try:
+                        if int(prev_pi.get("current_page")) != int(pi2.get("current_page")):
+                            return True, "state_edited"
+                    except Exception:
+                        pass
+
         await asyncio.sleep(float(poll_interval or 0.7))
+
 
 def _pagination_confirmed_last_page(state: Optional[Dict[str, Any]]) -> bool:
     if not state:
@@ -2308,15 +2504,16 @@ async def _safe_click_pagination_button(
 
         data_hex = str(btn.get("data") or "")
         clicked_text = (btn.get("text") or "").strip()
+        marker = _pagination_action_marker_from_message(callback_msg, buttons=get_callback_buttons(callback_msg))
 
-        if data_hex and is_recent_used_callback_action(bot_username, chat_id, mid, data_hex):
+        if data_hex and is_recent_used_callback_action(bot_username, chat_id, mid, data_hex, marker=marker):
             await asyncio.sleep(0.6)
             continue
 
         try:
             await click_callback(bot_username, chat_id, mid, data_hex)
             if data_hex:
-                mark_recent_used_callback_action(bot_username, chat_id, mid, data_hex)
+                mark_recent_used_callback_action(bot_username, chat_id, mid, data_hex, marker=marker)
 
             changed, reason = await _wait_for_files_or_state_change(
                 bot_username=bot_username,
@@ -2330,25 +2527,58 @@ async def _safe_click_pagination_button(
 
             if not changed:
                 if data_hex:
-                    unmark_recent_used_callback_action(bot_username, chat_id, mid, data_hex)
+                    unmark_recent_used_callback_action(bot_username, chat_id, mid, data_hex, marker=marker)
+
+                # next-only bot 常見「同一顆下一頁按鈕」且偶爾回覆慢，這裡不要立刻判定失敗，改為重試
+                if pick_reason == "next_keyword":
+                    await asyncio.sleep(1.1)
+                    continue
+
                 return False, "clicked_but_no_change", callback_msg
 
+            # 若檔案數量沒有增加，但狀態有變動，仍視為成功（避免某些頁沒有新檔案）
+            files_meta_after = collect_files_from_store(
+                bot_username,
+                int(max_return_files),
+                int(max_raw_payload_bytes),
+                min_message_id=int(min_message_id or 0)
+            )
+            files_unique_after = int(files_meta_after.get("files_unique_count", files_meta_after.get("files_count", 0)))
+            if files_unique_after < files_unique_before and pick_reason == "next_keyword":
+                pass
+
             return True, clicked_text, callback_msg
+
+        except FloodWaitError as e:
+            if data_hex:
+                unmark_recent_used_callback_action(bot_username, chat_id, mid, data_hex, marker=marker)
+            wait_s = 0
+            try:
+                wait_s = int(getattr(e, "seconds", 0) or 0)
+            except Exception:
+                wait_s = 0
+            push_log(stage="safe_click", result="flood_wait", step=step, extra={"bot_username": bot_username, "wait_seconds": wait_s}, max_logs=max_logs)
+            if wait_s > 0:
+                await asyncio.sleep(float(wait_s) + 1.0)
+            else:
+                await asyncio.sleep(1.2)
+            continue
 
         except MessageIdInvalidError:
             mark_invalid_callback(bot_username, chat_id, mid)
             if data_hex:
-                mark_recent_used_callback_action(bot_username, chat_id, mid, data_hex)
+                mark_recent_used_callback_action(bot_username, chat_id, mid, data_hex, marker=marker)
             await asyncio.sleep(0.9)
             continue
 
         except Exception:
             if data_hex:
-                mark_recent_used_callback_action(bot_username, chat_id, mid, data_hex)
+                mark_recent_used_callback_action(bot_username, chat_id, mid, data_hex, marker=marker)
             await asyncio.sleep(0.9)
             continue
 
     return False, "no_click", None
+
 
 async def _try_click_get_all_anytime(
     bot_username: str,
@@ -2460,6 +2690,8 @@ def _is_pagination_controls_message(callback_msg: Dict[str, Any]) -> bool:
     - 文字本身有可解析的 page_info（例如 1/47）
     或
     - 按鈕上有明確的「目前頁碼」高亮（例如 ✳️1、✅2）
+    或
+    - 按鈕上存在「下一頁/Next/➡️」等 next-like 控制鍵（支援只有下一頁按鈕的新 bot）
 
     這能避免把「分類選單」那種 1/2/3 按鈕誤判成分頁，導致一直按錯頁或觸發機器人回覆錯誤。
     """
@@ -2478,7 +2710,19 @@ def _is_pagination_controls_message(callback_msg: Dict[str, Any]) -> bool:
     if cur is not None:
         return True
 
+    if _has_next_like_button(callback_msg, next_keywords=[
+        "下一頁", "下页", "下一页",
+        "Next", "next",
+        ">", ">>", "»", "›", "»»",
+        "▶", "►", "⏩", "→", "➡", "➡️",
+        "⏭", "⏭️",
+        "更多", "more", "More",
+        "Forward", "forward"
+    ]):
+        return True
+
     return False
+
 
 def _message_store_max_mid_for_bot(bot_username: str) -> int:
     mx = 0
@@ -3868,6 +4112,20 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
                     pass
 
             if not ok_click:
+                if clicked_text == "clicked_but_no_change":
+                    timeline.append({"step": steps, "status": "note", "reason": "clicked_but_no_change; retry"})
+                    await asyncio.sleep(1.0)
+                    continue
+
+                # next-only bot 可能會短暫抓不到分頁控制訊息（例如訊息文字格式變化或回覆延遲），但仍有 next 按鈕時不要立刻停
+                try:
+                    if clicked_text == "no_click" and bool(state.get("has_next")):
+                        timeline.append({"step": steps, "status": "note", "reason": "no_click but has_next; retry"})
+                        await asyncio.sleep(1.0)
+                        continue
+                except Exception:
+                    pass
+
                 timeline.append({"step": steps, "status": "done", "reason": clicked_text})
                 return await _return_ok(clicked_text)
 
