@@ -1665,12 +1665,19 @@ def _sanitize_for_path(s: str, max_len: int = 80) -> str:
 
 def _ensure_download_folder_for_text(text: str) -> str:
     base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    downloads_root = os.path.join(base_dir, "downloads")
+    try:
+        os.makedirs(downloads_root, exist_ok=True)
+    except Exception:
+        downloads_root = base_dir
+
     folder_name = _sanitize_for_path(text, max_len=80)
-    folder_path = os.path.join(base_dir, folder_name)
+    folder_path = os.path.join(downloads_root, folder_name)
     try:
         os.makedirs(folder_path, exist_ok=True)
     except Exception:
-        tmp = os.path.join(base_dir, "download")
+        tmp = os.path.join(downloads_root, "download")
         os.makedirs(tmp, exist_ok=True)
         folder_path = tmp
     return folder_path
@@ -1925,7 +1932,7 @@ class DownloadAllMediaRequest(BaseModel):
     max_messages: int = 0
     include_out: bool = False
     slow_seconds: float = 0.15
-    create_zip: bool = True
+    create_zip: bool = False
 
 
 @app.post("/bots/download-all-media")
@@ -2025,7 +2032,7 @@ async def download_all_media_from_chat(payload: DownloadAllMediaRequest):
         base_name=bot_username,
         job_id=job_id,
         slow_seconds=float(payload.slow_seconds or 0.15),
-        create_zip=bool(payload.create_zip)
+        create_zip=False
     ))
 
     return {"status": "ok", "job_id": job_id, "total": len(files), "folder_path": folder_path}
