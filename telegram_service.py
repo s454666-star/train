@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest, DeleteHistoryRequest
@@ -11,6 +12,7 @@ import re
 import asyncio
 import time
 import traceback
+import zipfile
 import os
 from typing import Optional, List, Dict, Any, Tuple, Set
 from datetime import datetime, date
@@ -34,6 +36,7 @@ RECENT_USED_CALLBACK_TTL_SECONDS = 45.0
 
 _BACKFILL_LAST_AT: Dict[str, float] = {}
 _BACKFILL_THROTTLE_SECONDS = 0.9
+DOWNLOAD_SEEN_KEYS_BY_JOB: Dict[str, Set[str]] = {}
 
 DOWNLOAD_JOBS: Dict[str, Dict[str, Any]] = {}
 DOWNLOAD_SEEN_KEYS: Set[str] = set()
@@ -1713,9 +1716,15 @@ async def _download_one_file_by_message_id(
                 raise RuntimeError("invalid message_id")
 
             unique_key = _file_dedup_key(file_obj)
-            if unique_key in DOWNLOAD_SEEN_KEYS:
+
+            seen = DOWNLOAD_SEEN_KEYS_BY_JOB.get(job_id)
+            if seen is None:
+                seen = set()
+                DOWNLOAD_SEEN_KEYS_BY_JOB[job_id] = seen
+
+            if unique_key in seen:
                 return
-            DOWNLOAD_SEEN_KEYS.add(unique_key)
+            seen.add(unique_key)
 
             one = await client.get_messages(peer, ids=mid)
             if one is None:
@@ -1745,13 +1754,40 @@ async def _download_one_file_by_message_id(
                 await asyncio.sleep(float(slow_seconds))
 
 
+
+def _zip_folder_to_file(folder_path: str, zip_path: str) -> None:
+    try:
+        if not folder_path or not zip_path:
+            return
+        if not os.path.isdir(folder_path):
+            return
+
+        base_dir = os.path.dirname(os.path.abspath(zip_path))
+        if base_dir:
+            os.makedirs(base_dir, exist_ok=True)
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(folder_path):
+                for fn in files:
+                    fp = os.path.join(root, fn)
+                    if not os.path.isfile(fp):
+                        continue
+                    arc = os.path.relpath(fp, folder_path)
+                    zf.write(fp, arcname=arc)
+    except Exception as e:
+        push_log(stage="zip_folder", result="error", extra={"error": str(e), "folder_path": folder_path, "zip_path": zip_path, "trace": traceback.format_exc()[:800]})
+
+
+
 async def _background_download_files(
     bot_username: str,
     files: List[Dict[str, Any]],
     folder_path: str,
     base_name: str,
     job_id: str,
-    slow_seconds: float = 0.8
+    slow_seconds: float = 0.8,
+    create_zip: bool = False,
+    task_batch_size: int = 80
 ):
     peer = await _get_peer_for_bot(bot_username)
     if peer is None:
@@ -1759,38 +1795,77 @@ async def _background_download_files(
         job["status"] = "fail"
         job["last_error"] = "no peer"
         DOWNLOAD_JOBS[job_id] = job
+        try:
+            if job_id in DOWNLOAD_SEEN_KEYS_BY_JOB:
+                del DOWNLOAD_SEEN_KEYS_BY_JOB[job_id]
+        except Exception:
+            pass
         return
 
     job = DOWNLOAD_JOBS.get(job_id) or {}
     job["status"] = "running"
+    job["folder_path"] = folder_path
+    job["total"] = int(job.get("total", 0) or 0) if job.get("total") is not None else 0
+    if job["total"] <= 0:
+        job["total"] = len(files)
     DOWNLOAD_JOBS[job_id] = job
 
     tasks: List[asyncio.Task] = []
     idx = 0
-    for f in files:
-        idx = idx + 1
-        tasks.append(asyncio.create_task(_download_one_file_by_message_id(
-            bot_username=bot_username,
-            peer=peer,
-            file_obj=f,
-            folder_path=folder_path,
-            base_name=base_name,
-            index=idx,
-            job_id=job_id,
-            slow_seconds=slow_seconds
-        )))
 
     try:
+        for f in files:
+            idx = idx + 1
+            tasks.append(asyncio.create_task(_download_one_file_by_message_id(
+                bot_username=bot_username,
+                peer=peer,
+                file_obj=f,
+                folder_path=folder_path,
+                base_name=base_name,
+                index=idx,
+                job_id=job_id,
+                slow_seconds=slow_seconds
+            )))
+
+            if int(task_batch_size or 0) > 0 and len(tasks) >= int(task_batch_size):
+                await asyncio.gather(*tasks)
+                tasks.clear()
+
         if tasks:
             await asyncio.gather(*tasks)
+            tasks.clear()
+
         job = DOWNLOAD_JOBS.get(job_id) or {}
         job["status"] = "done"
         DOWNLOAD_JOBS[job_id] = job
+
+        if create_zip:
+            try:
+                zip_path = folder_path.rstrip("/\\") + ".zip"
+                _zip_folder_to_file(folder_path, zip_path)
+                job = DOWNLOAD_JOBS.get(job_id) or {}
+                job["zip_path"] = zip_path
+                job["zip_file"] = os.path.basename(zip_path)
+                job["zip_ready"] = bool(os.path.isfile(zip_path))
+                DOWNLOAD_JOBS[job_id] = job
+            except Exception as e:
+                job = DOWNLOAD_JOBS.get(job_id) or {}
+                job["zip_ready"] = False
+                job["zip_error"] = str(e)
+                DOWNLOAD_JOBS[job_id] = job
+
     except Exception as e:
         job = DOWNLOAD_JOBS.get(job_id) or {}
         job["status"] = "fail"
         job["last_error"] = str(e)
         DOWNLOAD_JOBS[job_id] = job
+    finally:
+        try:
+            if job_id in DOWNLOAD_SEEN_KEYS_BY_JOB:
+                del DOWNLOAD_SEEN_KEYS_BY_JOB[job_id]
+        except Exception:
+            pass
+
 
 
 class SendBotMessageRequest(BaseModel):
@@ -1842,6 +1917,142 @@ async def get_download_jobs(limit: int = 30):
         obj["job_id"] = k
         out.append(obj)
     return out
+
+
+
+class DownloadAllMediaRequest(BaseModel):
+    bot_username: str
+    max_messages: int = 0
+    include_out: bool = False
+    slow_seconds: float = 0.15
+    create_zip: bool = True
+
+
+@app.post("/bots/download-all-media")
+async def download_all_media_from_chat(payload: DownloadAllMediaRequest):
+    bot_username = str(payload.bot_username or "").strip()
+    if not bot_username:
+        return {"status": "error", "message": "bot_username_required"}
+
+    peer = await _get_peer_for_bot(bot_username)
+    if peer is None:
+        return {"status": "error", "message": "bot_not_found"}
+
+    job_id = str(uuid.uuid4())
+    folder_title = f"{bot_username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    folder_path = _ensure_download_folder_for_text(folder_title)
+
+    job = {
+        "created_at_s": _now_s(),
+        "status": "collecting",
+        "bot_username": bot_username,
+        "folder_path": folder_path,
+        "done": 0,
+        "failed": 0,
+        "total": 0,
+        "zip_ready": False,
+    }
+    DOWNLOAD_JOBS[job_id] = job
+
+    hard_cap = 50000
+    limit = int(payload.max_messages or 0)
+    if limit <= 0:
+        limit = hard_cap
+    if limit > hard_cap:
+        limit = hard_cap
+
+    files: List[Dict[str, Any]] = []
+    scanned = 0
+
+    try:
+        async for msg in client.iter_messages(peer, limit=limit):
+            scanned = scanned + 1
+
+            try:
+                if (not bool(payload.include_out)) and bool(getattr(msg, "out", False)):
+                    continue
+                if getattr(msg, "media", None) is None:
+                    continue
+            except Exception:
+                continue
+
+            fm = _extract_file_meta_mtproto(msg)
+            if not fm:
+                continue
+
+            files.append(fm)
+
+            if len(files) % 100 == 0:
+                job = DOWNLOAD_JOBS.get(job_id) or {}
+                job["status"] = "collecting"
+                job["total"] = len(files)
+                job["scanned_messages"] = scanned
+                DOWNLOAD_JOBS[job_id] = job
+
+    except FloodWaitError as e:
+        wait_s = int(getattr(e, "seconds", 5) or 5)
+        job = DOWNLOAD_JOBS.get(job_id) or {}
+        job["status"] = "fail"
+        job["last_error"] = f"FloodWaitError: {wait_s}"
+        DOWNLOAD_JOBS[job_id] = job
+        return {"status": "error", "job_id": job_id, "message": "flood_wait", "seconds": wait_s}
+
+    except Exception as e:
+        job = DOWNLOAD_JOBS.get(job_id) or {}
+        job["status"] = "fail"
+        job["last_error"] = str(e)
+        DOWNLOAD_JOBS[job_id] = job
+        return {"status": "error", "job_id": job_id, "message": "collect_failed"}
+
+    files.reverse()
+
+    job = DOWNLOAD_JOBS.get(job_id) or {}
+    job["status"] = "queued"
+    job["total"] = len(files)
+    job["scanned_messages"] = scanned
+    DOWNLOAD_JOBS[job_id] = job
+
+    if not files:
+        job = DOWNLOAD_JOBS.get(job_id) or {}
+        job["status"] = "done"
+        DOWNLOAD_JOBS[job_id] = job
+        return {"status": "ok", "job_id": job_id, "total": 0, "folder_path": folder_path}
+
+    asyncio.create_task(_background_download_files(
+        bot_username=bot_username,
+        files=files,
+        folder_path=folder_path,
+        base_name=bot_username,
+        job_id=job_id,
+        slow_seconds=float(payload.slow_seconds or 0.15),
+        create_zip=bool(payload.create_zip)
+    ))
+
+    return {"status": "ok", "job_id": job_id, "total": len(files), "folder_path": folder_path}
+
+
+@app.get("/bots/download-all-media-archive/{job_id}")
+async def download_all_media_archive(job_id: str):
+    job = DOWNLOAD_JOBS.get(job_id)
+    if not job:
+        return {"status": "error", "message": "job_not_found"}
+
+    if str(job.get("status")) != "done":
+        return {"status": "not_ready", "job": job}
+
+    zip_path = job.get("zip_path")
+    if not zip_path:
+        return {"status": "not_ready", "job": job}
+
+    if not os.path.isfile(zip_path):
+        return {"status": "not_ready", "job": job}
+
+    return FileResponse(
+        path=zip_path,
+        filename=os.path.basename(zip_path),
+        media_type="application/zip"
+    )
+
 
 
 class SendAndRunAllPagesRequest(BaseModel):
