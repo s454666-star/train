@@ -355,7 +355,7 @@ def process_keyword(driver, conn, keyword, type_value=2, max_detail_pages=5, max
 
 
 def main():
-    start_no = 1206587
+    start_no = 1181072
     count = 100000
     type_value = 2
 
