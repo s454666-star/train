@@ -7,6 +7,14 @@ from customtkinter import CTk, CTkLabel, CTkButton, CTkProgressBar, CTkEntry, CT
 import numpy as np
 import math
 import cv2  # 用於影片讀取和處理
+
+# ===== TensorFlow / MTCNN 穩定性設定 =====
+# 1) 關閉 oneDNN（在某些版本的 TF + oneDNN 組合下，MTCNN 可能會在無候選框時觸發 shape error）
+# 2) 降低 TF 原生層 log 噪音
+# 注意：必須在 import tensorflow / mtcnn 前設定才有效
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
 from mtcnn import MTCNN
 import re
 import traceback
@@ -252,6 +260,16 @@ class FaceExtractorApp:
         # 0 表示不縮放；建議 1280
         self.mtcnn_detect_max_side = 1280
 
+        # ===== 備援：OpenCV Haar Cascade（當 MTCNN / TensorFlow 異常時仍可繼續） =====
+        self._haar_face = None
+        try:
+            cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+            self._haar_face = cv2.CascadeClassifier(cascade_path)
+            if self._haar_face.empty():
+                self._haar_face = None
+        except Exception:
+            self._haar_face = None
+
         try:
             LOGGER.info("準備連接資料庫 host=%s port=%s database=%s", "mysql.mystar.monster", 3306, "star")
             _flush_logs()
@@ -279,6 +297,17 @@ class FaceExtractorApp:
         if detector is not None:
             return detector
 
+    def _reset_mtcnn_detector(self) -> None:
+        try:
+            if hasattr(self, "_mtcnn_local") and getattr(self._mtcnn_local, "detector", None) is not None:
+                try:
+                    delattr(self._mtcnn_local, "detector")
+                except Exception:
+                    self._mtcnn_local.detector = None
+        except Exception:
+            pass
+
+
         try:
             LOGGER.info("建立 MTCNN detector（thread=%s）", threading.current_thread().name)
             _flush_logs()
@@ -296,12 +325,25 @@ class FaceExtractorApp:
                 return image, 1.0
 
             h, w = image.shape[:2]
+            if h <= 0 or w <= 0:
+                return image, 1.0
+
             if max(h, w) <= max_side:
                 return image, 1.0
 
             scale = float(max_side) / float(max(h, w))
-            new_w = max(int(w * scale), 1)
-            new_h = max(int(h * scale), 1)
+            new_w = max(int(round(w * scale)), 1)
+            new_h = max(int(round(h * scale)), 1)
+
+            # MTCNN 在某些 TF 組合下，遇到特定尺寸更容易出現不穩定情況
+            # 這裡把尺寸調成偶數，並設最小邊界，降低 pyramid / resize 的極端 corner case
+            if new_w % 2 != 0:
+                new_w += 1
+            if new_h % 2 != 0:
+                new_h += 1
+            new_w = max(new_w, 64)
+            new_h = max(new_h, 64)
+
             resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
             return resized, scale
         except Exception:
@@ -507,11 +549,15 @@ class FaceExtractorApp:
             self.process_videos()
         except Exception as e:
             try:
-                LOGGER.exception("process_videos 發生未捕捉例外（將由 threading.excepthook 也記錄）: %s", e)
+                LOGGER.exception("process_videos 發生未捕捉例外: %s", e)
                 _flush_logs()
             except Exception:
                 pass
-            raise
+            try:
+                self.is_running = False
+                self._update_current_file(f"背景執行緒錯誤：{e}")
+            except Exception:
+                pass
         finally:
             try:
                 LOGGER.info("背景執行緒結束：process_videos")
@@ -789,6 +835,67 @@ class FaceExtractorApp:
 
     # ===== 人臉偵測與影像處理 =====
 
+    def _detect_faces_with_haar(self, frame: np.ndarray) -> List[np.ndarray]:
+        faces: List[np.ndarray] = []
+
+        if self._haar_face is None:
+            return faces
+
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        except Exception:
+            return faces
+
+        try:
+            # scaleFactor / minNeighbors 偏保守，降低誤判
+            rects = self._haar_face.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(60, 60),
+            )
+        except Exception:
+            return faces
+
+        if rects is None:
+            return faces
+
+        try:
+            for (x, y, w, h) in rects:
+                if w <= 0 or h <= 0:
+                    continue
+                face = self.extract_face(frame, int(x), int(y), int(w), int(h), 0)
+                if face is not None:
+                    faces.append(face)
+        except Exception:
+            return faces
+
+        return faces
+
+    def _safe_mtcnn_detect_faces(self, detector: MTCNN, rgb: np.ndarray) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        try:
+            # 確保資料連續、dtype 正確，減少底層實作踩雷機率
+            if rgb is None:
+                return None, "rgb is None"
+            if rgb.dtype != np.uint8:
+                rgb = rgb.astype(np.uint8, copy=False)
+            rgb = np.ascontiguousarray(rgb)
+
+            results = detector.detect_faces(rgb)
+            return results, None
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            try:
+                LOGGER.exception("MTCNN detect_faces 發生例外：%s", msg)
+                _flush_logs()
+            except Exception:
+                pass
+
+            # 這種錯誤常見於 TF runtime 在某些 edge case（例如候選框為空）時的 shape 推導
+            # 重新初始化 detector 往往可以讓後續影格繼續跑
+            self._reset_mtcnn_detector()
+            return None, msg
+
     def detect_faces(self, frame):
         try:
             LOGGER.debug("detect_faces() 進入，frame shape=%s", getattr(frame, "shape", None))
@@ -796,9 +903,13 @@ class FaceExtractorApp:
         except Exception:
             pass
 
-        faces = []
+        faces: List[np.ndarray] = []
+        if frame is None or not hasattr(frame, "shape"):
+            return faces
+
         angles = [0, 45, 90, 135, 180, 225, 270, 315]
 
+        detector: Optional[MTCNN] = None
         try:
             detector = self._get_mtcnn_detector()
         except Exception as e:
@@ -807,7 +918,9 @@ class FaceExtractorApp:
                 _flush_logs()
             except Exception:
                 pass
-            return faces
+            return self._detect_faces_with_haar(frame)
+
+        mtcnn_failed = False
 
         try:
             for angle in angles:
@@ -831,11 +944,21 @@ class FaceExtractorApp:
                 except Exception:
                     pass
 
-                results = detector.detect_faces(rgb)
+                results, err = self._safe_mtcnn_detect_faces(detector, rgb)
+                if err is not None:
+                    mtcnn_failed = True
+                    # detector 可能已被 reset，取新的再繼續
+                    try:
+                        detector = self._get_mtcnn_detector()
+                    except Exception:
+                        detector = None
+                    if detector is None:
+                        break
+                    continue
 
                 if results:
                     for result in results:
-                        x, y, w, h = result.get('box', [0, 0, 0, 0])
+                        x, y, w, h = result.get("box", [0, 0, 0, 0])
 
                         if scale and scale != 1.0:
                             try:
@@ -852,7 +975,19 @@ class FaceExtractorApp:
                         face = self.extract_face(src, x, y, w, h, angle)
                         if face is not None:
                             faces.append(face)
-                    break
+
+                    if faces:
+                        break
+
+            if not faces:
+                # 如果 MTCNN 在本次影格中發生過 TF/shape 例外，啟用 Haar 備援，避免整支程式被拖下去
+                if mtcnn_failed:
+                    try:
+                        LOGGER.warning("MTCNN 本次影格偵測失敗，改用 Haar Cascade 備援偵測")
+                        _flush_logs()
+                    except Exception:
+                        pass
+                    faces = self._detect_faces_with_haar(frame)
 
             print(f"偵測到 {len(faces)} 張人臉")
         except Exception as e:
@@ -860,6 +995,7 @@ class FaceExtractorApp:
             traceback.print_exc()
 
         return faces
+
 
     def rotate_image(self, image, angle):
         (h, w) = image.shape[:2]
