@@ -37,6 +37,7 @@ RECENT_USED_CALLBACK_TTL_SECONDS = 45.0
 _BACKFILL_LAST_AT: Dict[str, float] = {}
 _BACKFILL_THROTTLE_SECONDS = 0.9
 DOWNLOAD_SEEN_KEYS_BY_JOB: Dict[str, Set[str]] = {}
+DOWNLOAD_RESERVED_PATHS_BY_JOB: Dict[str, Set[str]] = {}
 
 DOWNLOAD_JOBS: Dict[str, Dict[str, Any]] = {}
 DOWNLOAD_SEEN_KEYS: Set[str] = set()
@@ -1138,6 +1139,46 @@ def _is_meaningful_state_message_for_pagination(bot_username: str, msg: Optional
     return False
 
 
+def _is_bot_completion_message(msg: Optional[Dict[str, Any]]) -> bool:
+    if not msg:
+        return False
+
+    if get_callback_buttons(msg):
+        return False
+
+    text = str(msg.get("text") or "").strip()
+    if not text:
+        return False
+
+    if extract_page_info(text) is not None:
+        return False
+
+    normalized = text.lower()
+    completion_keywords = [
+        "發送完成",
+        "发送完成",
+        "已發送完畢",
+        "已发送完毕",
+        "已發送完成",
+        "已发送完成",
+        "發送完畢",
+        "发送完毕",
+        "發送完了",
+        "发送完了",
+        "全部發送完成",
+        "全部发送完成",
+        "以下代碼的內容發送完成",
+        "以下代码的内容发送完成",
+        "完成",
+    ]
+
+    for kw in completion_keywords:
+        if kw and kw.lower() in normalized:
+            return True
+
+    return False
+
+
 def find_latest_callback_message(bot_username: str, skip_invalid: bool = False) -> Optional[Dict[str, Any]]:
     latest = None
     for msg in MESSAGE_STORE.values():
@@ -1706,6 +1747,55 @@ def _guess_ext_from_name_or_mime(file_name: Optional[str], mime_type: Optional[s
     return mapping.get(mt, "")
 
 
+def _safe_download_ext(file_name: Optional[str], mime_type: Optional[str]) -> str:
+    ext = _guess_ext_from_name_or_mime(file_name, mime_type)
+    if ext and re.fullmatch(r"\.[A-Za-z0-9]{1,10}", ext):
+        return ext
+    return ""
+
+
+def _reserve_download_file_path(
+    folder_path: str,
+    file_obj: Dict[str, Any],
+    base_name: str,
+    index: int,
+    job_id: str
+) -> str:
+    original_name = str(file_obj.get("file_name") or "").strip()
+    ext = _safe_download_ext(original_name, file_obj.get("mime_type"))
+
+    if original_name:
+        stem = original_name
+        if "." in original_name:
+            stem = original_name.rsplit(".", 1)[0]
+        safe_stem = _sanitize_for_path(stem, max_len=120)
+        if not safe_stem:
+            safe_stem = "download"
+    else:
+        safe_stem = f"{_sanitize_for_path(base_name, max_len=90)}_{index}"
+
+    reserved = DOWNLOAD_RESERVED_PATHS_BY_JOB.get(job_id)
+    if reserved is None:
+        reserved = set()
+        DOWNLOAD_RESERVED_PATHS_BY_JOB[job_id] = reserved
+
+    suffix = 0
+    while True:
+        if suffix <= 0:
+            candidate_name = f"{safe_stem}{ext}"
+        else:
+            candidate_name = f"{safe_stem} ({suffix}){ext}"
+
+        candidate_path = os.path.join(folder_path, candidate_name)
+        normalized = os.path.normcase(candidate_path)
+        if normalized in reserved or os.path.exists(candidate_path):
+            suffix = suffix + 1
+            continue
+
+        reserved.add(normalized)
+        return candidate_path
+
+
 async def _download_one_file_by_message_id(
     bot_username: str,
     peer: Any,
@@ -1737,9 +1827,13 @@ async def _download_one_file_by_message_id(
             if one is None:
                 raise RuntimeError("message not found")
 
-            ext = _guess_ext_from_name_or_mime(file_obj.get("file_name"), file_obj.get("mime_type"))
-            safe_base = _sanitize_for_path(base_name, max_len=90)
-            file_path = os.path.join(folder_path, f"{safe_base}_{index}{ext or ''}")
+            file_path = _reserve_download_file_path(
+                folder_path=folder_path,
+                file_obj=file_obj,
+                base_name=base_name,
+                index=index,
+                job_id=job_id
+            )
 
             await client.download_media(one, file=file_path)
 
@@ -1870,6 +1964,11 @@ async def _background_download_files(
         try:
             if job_id in DOWNLOAD_SEEN_KEYS_BY_JOB:
                 del DOWNLOAD_SEEN_KEYS_BY_JOB[job_id]
+        except Exception:
+            pass
+        try:
+            if job_id in DOWNLOAD_RESERVED_PATHS_BY_JOB:
+                del DOWNLOAD_RESERVED_PATHS_BY_JOB[job_id]
         except Exception:
             pass
 
@@ -3289,6 +3388,14 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         asyncio.create_task(_start_background_download_and_cleanup())
         return resp
 
+    async def _sleep_after_pagination_click() -> None:
+        try:
+            delay_s = float(payload.delay_seconds or 0)
+        except Exception:
+            delay_s = 0.0
+        if delay_s > 0:
+            await asyncio.sleep(delay_s)
+
     try:
         await backfill_latest_from_bot(payload.bot_username, limit=120, timeout_seconds=6.0, max_logs=payload.debug_max_logs, step=0, force=True)
         before_mid_pre_send = _message_store_max_mid_for_bot(payload.bot_username)
@@ -3567,11 +3674,13 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
                     if clicked_page_int is not None:
                         last_clicked_page = int(clicked_page_int)
                     timeline.append({"step": steps, "status": "clicked", "mode": "callback", "desc": clicked_or_err})
+                    await _sleep_after_pagination_click()
                 else:
                     if str(clicked_or_err) == "clicked_but_no_change":
                         if payload.text_next_fallback_enabled and bool(state.get("has_next")):
                             await client.send_message(payload.bot_username, payload.text_next_command)
                             timeline.append({"step": steps, "status": "clicked", "mode": "text_next_fallback", "desc": payload.text_next_command})
+                            await _sleep_after_pagination_click()
                             await asyncio.sleep(0.7)
                             await _wait_for_files_or_state_change(
                                 bot_username=payload.bot_username,
@@ -3598,6 +3707,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
                     if payload.text_next_fallback_enabled and bool(state.get("has_next")):
                         await client.send_message(payload.bot_username, payload.text_next_command)
                         timeline.append({"step": steps, "status": "clicked", "mode": "text_next_fallback", "desc": payload.text_next_command})
+                        await _sleep_after_pagination_click()
                         await asyncio.sleep(0.7)
                         await _wait_for_files_or_state_change(
                             bot_username=payload.bot_username,
@@ -3621,6 +3731,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
                 if pi and payload.text_next_fallback_enabled and bool(state.get("has_next")):
                     await client.send_message(payload.bot_username, payload.text_next_command)
                     timeline.append({"step": steps, "status": "clicked", "mode": "text_next", "desc": payload.text_next_command})
+                    await _sleep_after_pagination_click()
                     await asyncio.sleep(0.7)
                     await _wait_for_files_or_state_change(
                         bot_username=payload.bot_username,
@@ -3660,9 +3771,6 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
                     if payload.allow_ok_when_no_buttons:
                         return await _return_ok("no buttons and no next; return files")
                     return await _return_fail("no buttons and no next; cannot paginate")
-
-            if payload.delay_seconds > 0:
-                await asyncio.sleep(int(payload.delay_seconds))
 
         if payload.allow_ok_when_no_buttons:
             return await _return_ok("reached max_steps; return files")
@@ -4236,6 +4344,16 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
             )
 
             if not chosen_now:
+                latest_any = find_latest_bot_message_any(payload.bot_username, require_meaningful=True)
+                if _is_bot_completion_message(latest_any):
+                    timeline.append({
+                        "step": steps,
+                        "status": "done",
+                        "reason": "completion message detected; stop",
+                        "message_id": latest_any.get("message_id"),
+                        "text_preview": (latest_any.get("text") or "")[:200]
+                    })
+                    return await _return_ok("completion message detected; stop")
                 timeline.append({"step": steps, "status": "observe", "reason": "no state message; sleep"})
                 await asyncio.sleep(float(payload.observe_when_no_controls_poll_seconds or 0.5))
                 continue
@@ -4244,6 +4362,19 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
             state = _pagination_state_from_message(chosen_now, next_keywords=payload.next_text_keywords) or {}
             pi_now = state.get("page_info")
             total_items_now = state.get("total_items")
+            latest_any = find_latest_bot_message_any(payload.bot_username, require_meaningful=True)
+            if latest_any:
+                latest_any_mid = int(latest_any.get("message_id", 0) or 0)
+                chosen_now_mid = int(chosen_now.get("message_id", 0) or 0)
+                if latest_any_mid > chosen_now_mid and _is_bot_completion_message(latest_any):
+                    timeline.append({
+                        "step": steps,
+                        "status": "done",
+                        "reason": "completion message detected; stop",
+                        "message_id": latest_any.get("message_id"),
+                        "text_preview": (latest_any.get("text") or "")[:200]
+                    })
+                    return await _return_ok("completion message detected; stop")
 
             if assumed_total_items is None and total_items_now is not None:
                 try:
