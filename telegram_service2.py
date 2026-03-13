@@ -457,6 +457,9 @@ async def save_message(message: Message, forced_sender_username: Optional[str] =
         "buttons": [],
         "is_edited": is_edited,
         "saved_at_ms": _now_ms(),
+        "reply_to_message_id": int(
+            getattr(getattr(message, "reply_to", None), "reply_to_msg_id", 0) or 0
+        ) if getattr(message, "reply_to", None) else None,
         "file": file_meta,
         "raw_payload": file_meta.get("raw_payload") if file_meta else _safe_message_payload(message),
     }
@@ -1916,6 +1919,53 @@ async def _cleanup_chat_after_run(bot_username: str, min_mid: int, scope: str, l
     ids_sorted = sorted(ids)
     push_log(stage="cleanup", result="collected", extra={"scope": "run", "count": len(ids_sorted), "from": ids_sorted[0], "to": ids_sorted[-1], "min_mid": min_mid})
     await _delete_messages_in_batches(bot_username, ids_sorted, revoke=True)
+
+
+async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[Dict[str, Any]], min_message_id: int = 0):
+    msg = trigger_msg or {}
+    ids: List[int] = []
+
+    try:
+        trigger_mid = int(msg.get("message_id", 0) or 0)
+    except Exception:
+        trigger_mid = 0
+
+    try:
+        reply_mid = int(msg.get("reply_to_message_id", 0) or 0)
+    except Exception:
+        reply_mid = 0
+
+    if trigger_mid > 0:
+        ids.append(trigger_mid)
+    if reply_mid > 0:
+        ids.append(reply_mid)
+    elif int(min_message_id or 0) > 0:
+        ids.append(int(min_message_id or 0))
+
+    deduped: List[int] = []
+    seen: Set[int] = set()
+    for mid in ids:
+        if mid <= 0 or mid in seen:
+            continue
+        seen.add(mid)
+        deduped.append(mid)
+
+    if not deduped:
+        push_log(stage="cleanup_not_found", result="skip_no_ids", extra={"bot_username": bot_username})
+        return
+
+    push_log(
+        stage="cleanup_not_found",
+        result="delete_targeted",
+        extra={
+            "bot_username": bot_username,
+            "message_ids": deduped,
+            "trigger_message_id": trigger_mid,
+            "reply_to_message_id": reply_mid,
+            "fallback_min_message_id": int(min_message_id or 0),
+        }
+    )
+    await _delete_messages_in_batches(bot_username, deduped, revoke=True)
 
 def _get_debug_logs(limit: int = 200) -> List[Dict[str, Any]]:
     try:
@@ -4200,6 +4250,11 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             return await _return_fail("timeout waiting for first bot message after sending")
 
         if _is_bot_not_found_message(first_any):
+            await _cleanup_not_found_messages(
+                payload.bot_username,
+                first_any,
+                min_message_id=int(cleanup_min_mid or 0)
+            )
             timeline.append({
                 "step": 0,
                 "status": "done",
@@ -4244,6 +4299,11 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         })
 
         if _is_bot_not_found_message(chosen_first):
+            await _cleanup_not_found_messages(
+                payload.bot_username,
+                chosen_first,
+                min_message_id=int(cleanup_min_mid or 0)
+            )
             return await _return_ok("not found message detected; stop")
 
         clicked_get_all = False
@@ -4430,6 +4490,11 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             if not msg_for_state:
                 latest_any = find_latest_bot_message_any(payload.bot_username, require_meaningful=False)
                 if _is_bot_not_found_message(latest_any):
+                    await _cleanup_not_found_messages(
+                        payload.bot_username,
+                        latest_any,
+                        min_message_id=int(cleanup_min_mid or 0)
+                    )
                     timeline.append({
                         "step": steps,
                         "status": "done",
@@ -5196,6 +5261,11 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
         if not chosen_first:
             latest_any = find_latest_bot_message_any(payload.bot_username, require_meaningful=False)
             if _is_bot_not_found_message(latest_any):
+                await _cleanup_not_found_messages(
+                    payload.bot_username,
+                    latest_any,
+                    min_message_id=int(cleanup_min_mid or 0)
+                )
                 timeline.append({
                     "step": 0,
                     "status": "done",
@@ -5235,6 +5305,11 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
         })
 
         if _is_bot_not_found_message(chosen_first):
+            await _cleanup_not_found_messages(
+                payload.bot_username,
+                chosen_first,
+                min_message_id=int(cleanup_min_mid or 0)
+            )
             return await _return_ok("not found message detected; stop")
 
         no_new_files_rounds = 0
@@ -5267,6 +5342,11 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
             if not chosen_now:
                 latest_any = find_latest_bot_message_any(payload.bot_username, require_meaningful=False)
                 if _is_bot_not_found_message(latest_any):
+                    await _cleanup_not_found_messages(
+                        payload.bot_username,
+                        latest_any,
+                        min_message_id=int(cleanup_min_mid or 0)
+                    )
                     timeline.append({
                         "step": steps,
                         "status": "done",
@@ -5320,6 +5400,11 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
                 latest_any_mid = int(latest_any.get("message_id", 0) or 0)
                 chosen_now_mid = int(chosen_now.get("message_id", 0) or 0)
                 if latest_any_mid >= chosen_now_mid and _is_bot_not_found_message(latest_any):
+                    await _cleanup_not_found_messages(
+                        payload.bot_username,
+                        latest_any,
+                        min_message_id=int(cleanup_min_mid or 0)
+                    )
                     timeline.append({
                         "step": steps,
                         "status": "done",
