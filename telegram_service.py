@@ -450,6 +450,7 @@ async def save_message(message: Message, forced_sender_username: Optional[str] =
         "id": str(uuid.uuid4()),
         "message_id": message.id,
         "chat_id": message.chat_id,
+        "bot_username": forced_sender_username or sender_username,
         "sender_username": sender_username,
         "is_bot": is_bot,
         "date": message.date.isoformat() if message.date else None,
@@ -482,6 +483,22 @@ async def save_message(message: Message, forced_sender_username: Optional[str] =
 
     key = (int(message.chat_id or 0), int(message.id or 0))
     MESSAGE_STORE[key] = data
+
+
+def _normalize_bot_username(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _message_matches_bot(msg: Optional[Dict[str, Any]], bot_username: str) -> bool:
+    if not msg:
+        return False
+
+    target = _normalize_bot_username(bot_username)
+    if not target:
+        return False
+
+    source = _normalize_bot_username(msg.get("bot_username") or msg.get("sender_username"))
+    return source == target
 
 
 @client.on(events.NewMessage)
@@ -1165,11 +1182,14 @@ def _is_pagination_callback_message(callback_msg: Dict[str, Any], next_keywords:
 def _is_meaningful_state_message_for_pagination(bot_username: str, msg: Optional[Dict[str, Any]]) -> bool:
     if not msg:
         return False
-    if msg.get("sender_username") != bot_username:
+    if not _message_matches_bot(msg, bot_username):
         return False
 
     buttons = get_callback_buttons(msg)
     if buttons:
+        return True
+
+    if msg.get("file"):
         return True
 
     t = (msg.get("text") or "").strip()
@@ -1306,7 +1326,7 @@ def _is_bot_not_found_message(msg: Optional[Dict[str, Any]]) -> bool:
 def find_latest_callback_message(bot_username: str, skip_invalid: bool = False) -> Optional[Dict[str, Any]]:
     latest = None
     for msg in MESSAGE_STORE.values():
-        if msg.get("sender_username") != bot_username:
+        if not _message_matches_bot(msg, bot_username):
             continue
         if not get_callback_buttons(msg):
             continue
@@ -1338,7 +1358,7 @@ def find_latest_pagination_callback_message(
     msgs: List[Dict[str, Any]] = []
 
     for msg in MESSAGE_STORE.values():
-        if msg.get("sender_username") != bot_username:
+        if not _message_matches_bot(msg, bot_username):
             continue
 
         mid = int(msg.get("message_id", 0) or 0)
@@ -1592,7 +1612,7 @@ def collect_files_from_store(
     raw_files: List[Dict[str, Any]] = []
 
     for m in reversed(msgs):
-        if m.get("sender_username") != bot_username:
+        if not _message_matches_bot(m, bot_username):
             continue
 
         mid = int(m.get("message_id") or 0)
@@ -1667,7 +1687,7 @@ def summarize_latest_bot_message(bot_username: str, min_message_id: int = 0) -> 
     latest = None
 
     for msg in MESSAGE_STORE.values():
-        if msg.get("sender_username") != bot_username:
+        if not _message_matches_bot(msg, bot_username):
             continue
 
         mid = int(msg.get("message_id", 0) or 0)
@@ -1710,7 +1730,9 @@ def _attach_bot_result_snapshot(
         "files_unique_count": files_unique_count,
         "not_found_message_detected": bool(latest_message and latest_message.get("kind") == "not_found"),
         "latest_message_kind": latest_message.get("kind") if latest_message else None,
+        "run_completed": str(result.get("status") or "").lower() == "ok",
     }
+    result["completed"] = bool(result["outcome"]["run_completed"])
 
     return result
 
@@ -2672,7 +2694,7 @@ async def _wait_for_files_or_state_change(
     if prev_msg is None:
         try:
             for m in MESSAGE_STORE.values():
-                if m.get("sender_username") != bot_username:
+                if not _message_matches_bot(m, bot_username):
                     continue
                 if int(m.get("message_id", 0) or 0) == int(prev_state_msg_id or 0):
                     prev_msg = m
@@ -2911,7 +2933,7 @@ def _find_best_callback_candidate(
     candidates: List[Dict[str, Any]] = []
 
     for m in reversed(msgs):
-        if m.get("sender_username") != bot_username:
+        if not _message_matches_bot(m, bot_username):
             continue
         buttons = get_callback_buttons(m)
         if not buttons:
@@ -3572,7 +3594,7 @@ def _is_pagination_controls_message(callback_msg: Dict[str, Any]) -> bool:
 def _message_store_max_mid_for_bot(bot_username: str) -> int:
     mx = 0
     for msg in MESSAGE_STORE.values():
-        if msg.get("sender_username") != bot_username:
+        if not _message_matches_bot(msg, bot_username):
             continue
         try:
             mid = int(msg.get("message_id", 0))
