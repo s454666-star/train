@@ -1872,31 +1872,45 @@ async def _delete_messages_in_batches(bot_username: str, message_ids: List[int],
         await asyncio.sleep(0.2)
 
 
-async def _cleanup_chat_after_run(bot_username: str, min_mid: int, scope: str, limit: int):
+async def _cleanup_chat_after_run(
+    bot_username: str,
+    min_mid: int = 0,
+    scope: str = "run",
+    limit: int = 300,
+    max_mid: int = 0,
+    min_message_id: Optional[int] = None,
+    max_message_id: Optional[int] = None,
+    max_logs: int = 2000
+):
     scope = (scope or "run").strip().lower()
     if scope not in ["run", "all"]:
         scope = "run"
 
+    lower_bound = int(min_message_id if min_message_id is not None else (min_mid or 0))
+    upper_bound = int(max_message_id if max_message_id is not None else (max_mid or 0))
+    if upper_bound > 0 and upper_bound < lower_bound:
+        upper_bound = lower_bound
+
     peer = await _get_peer_for_bot(bot_username)
     if peer is None:
-        push_log(stage="cleanup", result="no_peer", extra={"bot_username": bot_username, "scope": scope})
+        push_log(stage="cleanup", result="no_peer", extra={"bot_username": bot_username, "scope": scope}, max_logs=max_logs)
         return
 
     if scope == "all":
         try:
             await client(DeleteHistoryRequest(peer=peer, max_id=0, just_clear=False, revoke=True))
-            push_log(stage="cleanup", result="delete_history_ok", extra={"scope": "all"})
+            push_log(stage="cleanup", result="delete_history_ok", extra={"scope": "all"}, max_logs=max_logs)
         except FloodWaitError as e:
             wait_s = int(getattr(e, "seconds", 5) or 5)
-            push_log(stage="cleanup", result="delete_history_flood_wait", extra={"seconds": wait_s})
+            push_log(stage="cleanup", result="delete_history_flood_wait", extra={"seconds": wait_s}, max_logs=max_logs)
             await asyncio.sleep(min(wait_s + 1, 20))
             try:
                 await client(DeleteHistoryRequest(peer=peer, max_id=0, just_clear=False, revoke=True))
-                push_log(stage="cleanup", result="delete_history_ok_after_wait", extra={"scope": "all"})
+                push_log(stage="cleanup", result="delete_history_ok_after_wait", extra={"scope": "all"}, max_logs=max_logs)
             except Exception as e2:
-                push_log(stage="cleanup", result="delete_history_error", extra={"error": str(e2), "trace": traceback.format_exc()[:800]})
+                push_log(stage="cleanup", result="delete_history_error", extra={"error": str(e2), "trace": traceback.format_exc()[:800]}, max_logs=max_logs)
         except Exception as e:
-            push_log(stage="cleanup", result="delete_history_error", extra={"error": str(e), "trace": traceback.format_exc()[:800]})
+            push_log(stage="cleanup", result="delete_history_error", extra={"error": str(e), "trace": traceback.format_exc()[:800]}, max_logs=max_logs)
         return
 
     ids: List[int] = []
@@ -1906,18 +1920,21 @@ async def _cleanup_chat_after_run(bot_username: str, min_mid: int, scope: str, l
                 mid = int(msg.id or 0)
             except Exception:
                 continue
-            if mid >= int(min_mid or 0):
-                ids.append(mid)
+            if mid < lower_bound:
+                continue
+            if upper_bound > 0 and mid > upper_bound:
+                continue
+            ids.append(mid)
     except Exception as e:
-        push_log(stage="cleanup", result="iter_messages_error", extra={"error": str(e), "trace": traceback.format_exc()[:800]})
+        push_log(stage="cleanup", result="iter_messages_error", extra={"error": str(e), "trace": traceback.format_exc()[:800]}, max_logs=max_logs)
         return
 
     if not ids:
-        push_log(stage="cleanup", result="no_messages_to_delete", extra={"scope": "run", "min_mid": min_mid})
+        push_log(stage="cleanup", result="no_messages_to_delete", extra={"scope": "run", "min_mid": lower_bound, "max_mid": upper_bound}, max_logs=max_logs)
         return
 
     ids_sorted = sorted(ids)
-    push_log(stage="cleanup", result="collected", extra={"scope": "run", "count": len(ids_sorted), "from": ids_sorted[0], "to": ids_sorted[-1], "min_mid": min_mid})
+    push_log(stage="cleanup", result="collected", extra={"scope": "run", "count": len(ids_sorted), "from": ids_sorted[0], "to": ids_sorted[-1], "min_mid": lower_bound, "max_mid": upper_bound}, max_logs=max_logs)
     await _delete_messages_in_batches(bot_username, ids_sorted, revoke=True)
 
 
@@ -4127,6 +4144,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
     last_clicked_page: Optional[int] = None
     last_clicked_desc: str = ""
     cleanup_min_mid = 0
+    cleanup_max_mid = 0
 
     download_job_id = uuid.uuid4().hex
     folder_path = _ensure_download_folder_for_text(payload.text)
@@ -4162,13 +4180,29 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         resp["download"] = {"job_id": download_job_id, "folder_path": folder_path, "base_name": payload.text}
         return resp
 
+    def _freeze_cleanup_window() -> None:
+        nonlocal cleanup_max_mid
+        lower_bound = int(cleanup_min_mid or 0)
+        if lower_bound <= 0:
+            cleanup_max_mid = 0
+            return
+
+        cleanup_max_mid = max(lower_bound, int(_message_store_max_mid_for_bot(payload.bot_username) or 0))
+
     async def _maybe_cleanup():
         if not payload.cleanup_after_done:
             return
         try:
             if int(cleanup_min_mid or 0) <= 0:
                 return
-            await _cleanup_chat_after_run(payload.bot_username, int(cleanup_min_mid or 0), str(payload.cleanup_scope or "run"), int(payload.cleanup_limit or 500))
+            await _cleanup_chat_after_run(
+                payload.bot_username,
+                int(cleanup_min_mid or 0),
+                str(payload.cleanup_scope or "run"),
+                int(payload.cleanup_limit or 500),
+                max_mid=int(cleanup_max_mid or 0),
+                max_logs=int(payload.debug_max_logs or 0),
+            )
         except Exception as e:
             push_log(stage="cleanup", result="exception", extra={"error": str(e), "trace": traceback.format_exc()[:900]})
 
@@ -4190,6 +4224,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
 
     async def _return_ok(reason: str) -> Dict[str, Any]:
         timeline.append({"step": steps, "status": "done", "reason": reason})
+        _freeze_cleanup_window()
         resp = _attach_files({"status": "ok", "reason": reason, "steps": steps, "timeline": timeline})
         resp = _attach_bot_result_snapshot(
             resp,
@@ -4206,6 +4241,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         resp: Dict[str, Any] = {"status": "fail", "reason": reason, "steps": steps, "timeline": timeline}
         if error:
             resp["error"] = error
+        _freeze_cleanup_window()
         resp = _attach_files(resp)
         resp = _attach_bot_result_snapshot(
             resp,
@@ -5156,8 +5192,19 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
     steps = 0
     visited_pages: Set[int] = set()
     cleanup_min_mid = 0
+    cleanup_max_mid = 0
+
+    def _freeze_cleanup_window() -> None:
+        nonlocal cleanup_max_mid
+        lower_bound = int(cleanup_min_mid or 0)
+        if lower_bound <= 0:
+            cleanup_max_mid = 0
+            return
+
+        cleanup_max_mid = max(lower_bound, int(_message_store_max_mid_for_bot(payload.bot_username) or 0))
 
     async def _return_ok(reason: str) -> Dict[str, Any]:
+        _freeze_cleanup_window()
         result: Dict[str, Any] = {
             "status": "ok",
             "reason": reason,
@@ -5184,6 +5231,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
                     scope=payload.cleanup_scope,
                     limit=int(payload.cleanup_limit or 0),
                     min_message_id=int(cleanup_min_mid or 0),
+                    max_message_id=int(cleanup_max_mid or 0),
                     max_logs=int(payload.debug_max_logs or 0)
                 )
             except Exception:
@@ -5194,6 +5242,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
         return result
 
     async def _return_fail(reason: str) -> Dict[str, Any]:
+        _freeze_cleanup_window()
         result: Dict[str, Any] = {
             "status": "fail",
             "reason": reason,
@@ -5220,6 +5269,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
                     scope=payload.cleanup_scope,
                     limit=int(payload.cleanup_limit or 0),
                     min_message_id=int(cleanup_min_mid or 0),
+                    max_message_id=int(cleanup_max_mid or 0),
                     max_logs=int(payload.debug_max_logs or 0)
                 )
             except Exception:
