@@ -272,13 +272,13 @@ class FaceExtractorApp:
             self._haar_face = None
 
         try:
-            db_config = load_db_config(prefix="FACE")
+            db_config = load_db_config(prefix="STAR")
             LOGGER.info("準備連接資料庫 host=%s port=%s database=%s", db_config["host"], db_config["port"], db_config["database"])
             _flush_logs()
         except Exception:
             pass
         try:
-            db_config = load_db_config(prefix="FACE")
+            db_config = load_db_config(prefix="STAR")
             self.db_connection = mysql.connector.connect(**db_config)
             self.db_cursor = self.db_connection.cursor()
             print("成功連接到資料庫")

@@ -17,7 +17,7 @@ def create_driver():
 
 
 def connect_db():
-    return pymysql.connect(**load_db_config(prefix="BTDIG", charset="utf8mb4"))
+    return pymysql.connect(**load_db_config(prefix="STAR", charset="utf8mb4"))
 
 
 def keyword_exists(conn, keyword):

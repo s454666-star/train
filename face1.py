@@ -84,7 +84,7 @@ class FaceExtractorApp:
 
         # 初始化資料庫連線
         try:
-            self.db_connection = mysql.connector.connect(**load_db_config(prefix="FACE"))
+            self.db_connection = mysql.connector.connect(**load_db_config(prefix="STAR"))
             self.db_cursor = self.db_connection.cursor()
             print("成功連接到資料庫")
         except mysql.connector.Error as err:

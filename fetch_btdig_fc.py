@@ -15,7 +15,7 @@ from db_env import load_db_config
 
 
 def connect_db():
-    return pymysql.connect(**load_db_config(prefix="BTDIG", charset="utf8mb4"))
+    return pymysql.connect(**load_db_config(prefix="STAR", charset="utf8mb4"))
 
 
 def safe_str(value, max_len):
