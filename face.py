@@ -19,12 +19,15 @@ from mtcnn import MTCNN
 import re
 import traceback
 import shutil
+import json
 import mysql.connector
 import sys
 import logging
 import faulthandler
 import atexit
 import platform
+from urllib import request as urllib_request
+from urllib import error as urllib_error
 
 from typing import Optional, List, Dict, Any, Tuple, Set
 from datetime import datetime, date
@@ -385,6 +388,73 @@ class FaceExtractorApp:
         output_base_name = os.path.basename(os.path.abspath(output_dir))
         original_ext = os.path.splitext(original_video_path)[1].lower() or ".mp4"
         return self.sanitize_filename(f"{output_base_name}{original_ext}")
+
+    def eagle_api_request(self, method: str, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = f"http://localhost:41595{endpoint}"
+        data = None
+        headers = {}
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        request = urllib_request.Request(url, data=data, headers=headers, method=method.upper())
+        try:
+            with urllib_request.urlopen(request, timeout=10) as response:
+                body = response.read().decode("utf-8")
+        except urllib_error.URLError as err:
+            raise RuntimeError(f"Eagle API connection failed: {err}") from err
+
+        try:
+            result = json.loads(body)
+        except json.JSONDecodeError as err:
+            raise RuntimeError(f"Eagle API returned non-JSON: {body}") from err
+
+        if result.get("status") != "success":
+            raise RuntimeError(f"Eagle API returned failure: {result}")
+        return result
+
+    def import_video_to_eagle_retry_library(self, video_path: str, item_name: str) -> Dict[str, Any]:
+        target_library_name = "重跑資源"
+        library_info = self.eagle_api_request("GET", "/api/library/info")
+        current_library = (library_info.get("data") or {}).get("library") or {}
+        current_library_name = current_library.get("name")
+        current_library_path = current_library.get("path")
+        target_library_path = current_library_path if current_library_name == target_library_name else None
+
+        if not target_library_path:
+            history = self.eagle_api_request("GET", "/api/library/history").get("data") or []
+            for library_path in history:
+                library_basename = os.path.splitext(os.path.basename(library_path))[0]
+                if library_basename == target_library_name:
+                    target_library_path = library_path
+                    break
+
+        if not target_library_path:
+            raise FileNotFoundError(f"Eagle library not found: {target_library_name}")
+
+        switched_library = current_library_path != target_library_path
+        if switched_library:
+            self.eagle_api_request("POST", "/api/library/switch", {"libraryPath": target_library_path})
+
+        try:
+            return self.eagle_api_request(
+                "POST",
+                "/api/item/addFromPath",
+                {
+                    "path": video_path,
+                    "name": item_name,
+                },
+            )
+        finally:
+            if switched_library and current_library_path:
+                try:
+                    self.eagle_api_request("POST", "/api/library/switch", {"libraryPath": current_library_path})
+                except Exception as err:
+                    try:
+                        LOGGER.exception("Failed to restore Eagle library: %s", err)
+                        _flush_logs()
+                    except Exception:
+                        pass
 
     # ===== 事件/UI =====
 
@@ -779,6 +849,9 @@ class FaceExtractorApp:
                     retry_copy_path = os.path.abspath(os.path.join(retry_dir, output_video_name))
                     shutil.copy2(destination_path, retry_copy_path)
                     print(f"已複製影片檔案至 Z:\\video(重跑): {retry_copy_path}")
+
+                    eagle_result = self.import_video_to_eagle_retry_library(destination_path, output_video_name)
+                    print(f"已匯入 Eagle 重跑資源: {eagle_result}")
                 except Exception as e:
                     try:
                         LOGGER.exception("移動影片檔案發生錯誤: %s", e)
