@@ -2024,6 +2024,7 @@ async def _cleanup_chat_after_run(
 async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[Dict[str, Any]], min_message_id: int = 0):
     msg = trigger_msg or {}
     ids: List[int] = []
+    run_floor_mid = int(min_message_id or 0)
 
     try:
         trigger_mid = int(msg.get("message_id", 0) or 0)
@@ -2035,12 +2036,12 @@ async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[D
     except Exception:
         reply_mid = 0
 
-    if trigger_mid > 0:
+    if trigger_mid > 0 and (run_floor_mid <= 0 or trigger_mid >= run_floor_mid):
         ids.append(trigger_mid)
-    if reply_mid > 0:
+    if reply_mid > 0 and (run_floor_mid <= 0 or reply_mid >= run_floor_mid):
         ids.append(reply_mid)
-    elif int(min_message_id or 0) > 0:
-        ids.append(int(min_message_id or 0))
+    elif run_floor_mid > 0:
+        ids.append(run_floor_mid)
 
     deduped: List[int] = []
     seen: Set[int] = set()
@@ -2062,7 +2063,7 @@ async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[D
             "message_ids": deduped,
             "trigger_message_id": trigger_mid,
             "reply_to_message_id": reply_mid,
-            "fallback_min_message_id": int(min_message_id or 0),
+            "fallback_min_message_id": run_floor_mid,
         }
     )
     await _delete_messages_in_batches(bot_username, deduped, revoke=True)
@@ -4246,6 +4247,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
     last_clicked_desc: str = ""
     cleanup_min_mid = 0
     cleanup_max_mid = 0
+    background_cleanup_enabled = True
 
     def _attach_files(resp: Dict[str, Any]) -> Dict[str, Any]:
         if not payload.include_files_in_response:
@@ -4275,7 +4277,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         cleanup_max_mid = max(lower_bound, int(_message_store_max_mid_for_bot(payload.bot_username) or 0))
 
     async def _maybe_cleanup():
-        if not payload.cleanup_after_done:
+        if not payload.cleanup_after_done or not background_cleanup_enabled:
             return
         try:
             if int(cleanup_min_mid or 0) <= 0:
@@ -4358,6 +4360,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             return await _return_fail("timeout waiting for first bot message after sending")
 
         if _is_bot_not_found_message(first_any):
+            background_cleanup_enabled = False
             await _cleanup_not_found_messages(
                 payload.bot_username,
                 first_any,
@@ -4407,6 +4410,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         })
 
         if _is_bot_not_found_message(chosen_first):
+            background_cleanup_enabled = False
             await _cleanup_not_found_messages(
                 payload.bot_username,
                 chosen_first,
@@ -4598,6 +4602,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             if not msg_for_state:
                 latest_any = find_latest_bot_message_any(payload.bot_username, require_meaningful=False)
                 if _is_bot_not_found_message(latest_any):
+                    background_cleanup_enabled = False
                     await _cleanup_not_found_messages(
                         payload.bot_username,
                         latest_any,
@@ -5265,6 +5270,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
     visited_pages: Set[int] = set()
     cleanup_min_mid = 0
     cleanup_max_mid = 0
+    cleanup_after_return_enabled = True
 
     def _freeze_cleanup_window() -> None:
         nonlocal cleanup_max_mid
@@ -5296,7 +5302,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
         if payload.debug:
             result["debug"] = _get_debug_logs(int(payload.debug_max_logs or 0))
 
-        if payload.cleanup_after_done:
+        if payload.cleanup_after_done and cleanup_after_return_enabled:
             try:
                 await _cleanup_chat_after_run(
                     bot_username=payload.bot_username,
@@ -5334,7 +5340,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
         if payload.debug:
             result["debug"] = _get_debug_logs(int(payload.debug_max_logs or 0))
 
-        if payload.cleanup_after_done:
+        if payload.cleanup_after_done and cleanup_after_return_enabled:
             try:
                 await _cleanup_chat_after_run(
                     bot_username=payload.bot_username,
@@ -5383,6 +5389,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
         if not chosen_first:
             latest_any = find_latest_bot_message_any(payload.bot_username, require_meaningful=False)
             if _is_bot_not_found_message(latest_any):
+                cleanup_after_return_enabled = False
                 await _cleanup_not_found_messages(
                     payload.bot_username,
                     latest_any,
@@ -5427,6 +5434,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
         })
 
         if _is_bot_not_found_message(chosen_first):
+            cleanup_after_return_enabled = False
             await _cleanup_not_found_messages(
                 payload.bot_username,
                 chosen_first,
@@ -5464,6 +5472,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
             if not chosen_now:
                 latest_any = find_latest_bot_message_any(payload.bot_username, require_meaningful=False)
                 if _is_bot_not_found_message(latest_any):
+                    cleanup_after_return_enabled = False
                     await _cleanup_not_found_messages(
                         payload.bot_username,
                         latest_any,
@@ -5522,6 +5531,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
                 latest_any_mid = int(latest_any.get("message_id", 0) or 0)
                 chosen_now_mid = int(chosen_now.get("message_id", 0) or 0)
                 if latest_any_mid >= chosen_now_mid and _is_bot_not_found_message(latest_any):
+                    cleanup_after_return_enabled = False
                     await _cleanup_not_found_messages(
                         payload.bot_username,
                         latest_any,
