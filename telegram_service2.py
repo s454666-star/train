@@ -2253,6 +2253,24 @@ def _ensure_download_folder_for_text(text: str) -> str:
     return folder_path
 
 
+def _media_download_subdir(file_type: Optional[str], mime_type: Optional[str]) -> str:
+    ft = str(file_type or "").strip().lower()
+    mt = str(mime_type or "").strip().lower()
+
+    if ft in ["photo", "image"] or mt.startswith("image/"):
+        return "images"
+    if ft == "video" or mt.startswith("video/"):
+        return "videos"
+    return "files"
+
+
+def _ensure_download_folder_for_media(text: str, file_type: Optional[str], mime_type: Optional[str]) -> str:
+    base_folder = _ensure_download_folder_for_text(text)
+    target_folder = os.path.join(base_folder, _media_download_subdir(file_type, mime_type))
+    os.makedirs(target_folder, exist_ok=True)
+    return target_folder
+
+
 def _guess_ext_from_name_or_mime(file_name: Optional[str], mime_type: Optional[str]) -> str:
     fn = (file_name or "").strip().lower()
     if "." in fn:
@@ -2426,7 +2444,11 @@ async def _download_group_message_media_to_local(
         title_for_path = str(group_title or f"group_{int(peer_id)}").strip()
         label = f"group_{int(peer_id)}_{title_for_path}"
 
-    folder_path = _ensure_download_folder_for_text(label)
+    folder_path = _ensure_download_folder_for_media(
+        label,
+        file_obj.get("file_type"),
+        file_obj.get("mime_type"),
+    )
     job_id = f"group-download-{int(peer_id)}-{int(message_id)}-{uuid.uuid4().hex}"
     file_path = _reserve_download_file_path(
         folder_path=folder_path,
