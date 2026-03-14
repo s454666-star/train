@@ -1963,6 +1963,7 @@ async def _cleanup_chat_after_run(
     max_mid: int = 0,
     min_message_id: Optional[int] = None,
     max_message_id: Optional[int] = None,
+    preserve_file_messages: bool = False,
     max_logs: int = 2000
 ):
     scope = (scope or "run").strip().lower()
@@ -2011,6 +2012,7 @@ async def _cleanup_chat_after_run(
     )
 
     ids: List[int] = []
+    preserved_file_ids: List[int] = []
     try:
         async for msg in client.iter_messages(peer, limit=max(int(limit or 300), 50)):
             try:
@@ -2021,17 +2023,23 @@ async def _cleanup_chat_after_run(
                 continue
             if upper_bound > 0 and mid > upper_bound:
                 continue
+            if preserve_file_messages and (
+                bool(getattr(msg, "media", None))
+                or _store_message_has_file(bot_username, mid)
+            ):
+                preserved_file_ids.append(mid)
+                continue
             ids.append(mid)
     except Exception as e:
         push_log(stage="cleanup", result="iter_messages_error", extra={"error": str(e), "trace": traceback.format_exc()[:800]}, max_logs=max_logs)
         return
 
     if not ids:
-        push_log(stage="cleanup", result="no_messages_to_delete", extra={"scope": "run", "min_mid": lower_bound, "max_mid": upper_bound}, max_logs=max_logs)
+        push_log(stage="cleanup", result="no_messages_to_delete", extra={"scope": "run", "min_mid": lower_bound, "max_mid": upper_bound, "preserved_file_ids": preserved_file_ids[:120]}, max_logs=max_logs)
         return
 
     ids_sorted = sorted(ids)
-    push_log(stage="cleanup", result="collected", extra={"scope": "run", "count": len(ids_sorted), "from": ids_sorted[0], "to": ids_sorted[-1], "min_mid": lower_bound, "max_mid": upper_bound}, max_logs=max_logs)
+    push_log(stage="cleanup", result="collected", extra={"scope": "run", "count": len(ids_sorted), "from": ids_sorted[0], "to": ids_sorted[-1], "min_mid": lower_bound, "max_mid": upper_bound, "preserved_file_ids": preserved_file_ids[:120]}, max_logs=max_logs)
     await _delete_messages_in_batches(bot_username, ids_sorted, revoke=True)
     push_log(
         stage="cleanup_snapshot",
@@ -2040,6 +2048,7 @@ async def _cleanup_chat_after_run(
             "bot_username": bot_username,
             "scope": scope,
             "deleted_message_ids": ids_sorted[:120],
+            "preserved_file_ids": preserved_file_ids[:120],
             "min_mid": lower_bound,
             "max_mid": upper_bound,
             "store_recent": _recent_store_snapshot(bot_username, limit=8, min_message_id=max(lower_bound - 3, 0)),
@@ -2049,10 +2058,16 @@ async def _cleanup_chat_after_run(
     )
 
 
-async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[Dict[str, Any]], min_message_id: int = 0):
+async def _cleanup_not_found_messages(
+    bot_username: str,
+    trigger_msg: Optional[Dict[str, Any]],
+    min_message_id: int = 0,
+    sent_message_id: int = 0
+):
     msg = trigger_msg or {}
     ids: List[int] = []
     run_floor_mid = int(min_message_id or 0)
+    sent_mid = int(sent_message_id or 0)
 
     try:
         trigger_mid = int(msg.get("message_id", 0) or 0)
@@ -2066,7 +2081,9 @@ async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[D
 
     if trigger_mid > 0 and (run_floor_mid <= 0 or trigger_mid >= run_floor_mid):
         ids.append(trigger_mid)
-    if reply_mid > 0 and (run_floor_mid <= 0 or reply_mid >= run_floor_mid):
+    if sent_mid > 0:
+        ids.append(sent_mid)
+    elif reply_mid > 0 and (run_floor_mid <= 0 or reply_mid >= run_floor_mid):
         ids.append(reply_mid)
     elif run_floor_mid > 0:
         ids.append(run_floor_mid)
@@ -2089,8 +2106,9 @@ async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[D
         extra={
             "bot_username": bot_username,
             "message_ids": deduped,
+            "sent_message_id": sent_mid,
             "trigger_message_id": trigger_mid,
-            "reply_to_message_id": reply_mid,
+            "candidate_reply_to_message_id": reply_mid,
             "fallback_min_message_id": run_floor_mid,
             "trigger_message": _message_debug_summary(msg),
             "store_recent": _recent_store_snapshot(bot_username, limit=8, min_message_id=max(run_floor_mid - 3, 0)),
@@ -2104,6 +2122,7 @@ async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[D
         extra={
             "bot_username": bot_username,
             "message_ids": deduped,
+            "sent_message_id": sent_mid,
             "store_recent": _recent_store_snapshot(bot_username, limit=8, min_message_id=max(run_floor_mid - 3, 0)),
             "live_recent": await _recent_live_snapshot(bot_username, limit=8),
         }
@@ -2152,6 +2171,24 @@ def _recent_store_snapshot(bot_username: str, limit: int = 8, min_message_id: in
     if limit > 0:
         items = items[-limit:]
     return items
+
+
+def _store_message_has_file(bot_username: str, message_id: int) -> bool:
+    target_mid = int(message_id or 0)
+    if target_mid <= 0:
+        return False
+
+    for msg in MESSAGE_STORE.values():
+        try:
+            if not _message_matches_bot(msg, bot_username):
+                continue
+            if int(msg.get("message_id", 0) or 0) != target_mid:
+                continue
+            return bool(msg.get("file"))
+        except Exception:
+            continue
+
+    return False
 
 
 async def _recent_live_snapshot(bot_username: str, limit: int = 8) -> List[Dict[str, Any]]:
@@ -4352,6 +4389,8 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
     cleanup_min_mid = 0
     cleanup_max_mid = 0
     background_cleanup_enabled = True
+    skip_cleanup_due_to_files = False
+    skip_cleanup_files_count = 0
 
     def _attach_files(resp: Dict[str, Any]) -> Dict[str, Any]:
         if not payload.include_files_in_response:
@@ -4383,6 +4422,26 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
     async def _maybe_cleanup():
         if not payload.cleanup_after_done or not background_cleanup_enabled:
             return
+        files_meta_for_cleanup = collect_files_from_store(
+            payload.bot_username,
+            int(payload.max_return_files or 0),
+            int(payload.max_raw_payload_bytes or 0),
+            min_message_id=int(cleanup_min_mid or 0),
+        )
+        current_run_files_count = int(files_meta_for_cleanup.get("files_unique_count", files_meta_for_cleanup.get("files_count", 0)) or 0)
+        if current_run_files_count > 0 or skip_cleanup_due_to_files:
+            push_log(
+                stage="cleanup",
+                result="preserve_files_skip",
+                extra={
+                    "bot_username": payload.bot_username,
+                    "files_unique_count": max(int(skip_cleanup_files_count or 0), current_run_files_count),
+                    "cleanup_min_mid": int(cleanup_min_mid or 0),
+                    "cleanup_max_mid": int(cleanup_max_mid or 0),
+                },
+                max_logs=int(payload.debug_max_logs or 0),
+            )
+            return
         try:
             if int(cleanup_min_mid or 0) <= 0:
                 return
@@ -4392,6 +4451,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
                 str(payload.cleanup_scope or "run"),
                 int(payload.cleanup_limit or 500),
                 max_mid=int(cleanup_max_mid or 0),
+                preserve_file_messages=True,
                 max_logs=int(payload.debug_max_logs or 0),
             )
         except Exception as e:
@@ -4401,6 +4461,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         await _maybe_cleanup()
 
     async def _return_ok(reason: str) -> Dict[str, Any]:
+        nonlocal skip_cleanup_due_to_files, skip_cleanup_files_count
         timeline.append({"step": steps, "status": "done", "reason": reason})
         _freeze_cleanup_window()
         resp = _attach_files({"status": "ok", "reason": reason, "steps": steps, "timeline": timeline})
@@ -4412,6 +4473,8 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             max_raw_payload_bytes=int(payload.max_raw_payload_bytes or 0),
             min_message_id=int(cleanup_min_mid or 0)
         )
+        skip_cleanup_files_count = int(resp.get("files_unique_count", 0) or 0)
+        skip_cleanup_due_to_files = skip_cleanup_files_count > 0
         asyncio.create_task(_start_background_cleanup())
         return resp
 
@@ -4493,7 +4556,8 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             await _cleanup_not_found_messages(
                 payload.bot_username,
                 first_any,
-                min_message_id=int(cleanup_min_mid or 0)
+                min_message_id=int(cleanup_min_mid or 0),
+                sent_message_id=int(cleanup_min_mid or 0)
             )
             timeline.append({
                 "step": 0,
@@ -4543,7 +4607,8 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             await _cleanup_not_found_messages(
                 payload.bot_username,
                 chosen_first,
-                min_message_id=int(cleanup_min_mid or 0)
+                min_message_id=int(cleanup_min_mid or 0),
+                sent_message_id=int(cleanup_min_mid or 0)
             )
             return await _return_ok("not found message detected; stop")
 
@@ -4735,7 +4800,8 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
                     await _cleanup_not_found_messages(
                         payload.bot_username,
                         latest_any,
-                        min_message_id=int(cleanup_min_mid or 0)
+                        min_message_id=int(cleanup_min_mid or 0),
+                        sent_message_id=int(cleanup_min_mid or 0)
                     )
                     timeline.append({
                         "step": steps,
@@ -5431,7 +5497,8 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
         if payload.debug:
             result["debug"] = _get_debug_logs(int(payload.debug_max_logs or 0))
 
-        if payload.cleanup_after_done and cleanup_after_return_enabled:
+        files_unique_count = int(result.get("files_unique_count", 0) or 0)
+        if payload.cleanup_after_done and cleanup_after_return_enabled and files_unique_count <= 0:
             try:
                 await _cleanup_chat_after_run(
                     bot_username=payload.bot_username,
@@ -5439,12 +5506,20 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
                     limit=int(payload.cleanup_limit or 0),
                     min_message_id=int(cleanup_min_mid or 0),
                     max_message_id=int(cleanup_max_mid or 0),
+                    preserve_file_messages=True,
                     max_logs=int(payload.debug_max_logs or 0)
                 )
             except Exception:
                 push_log(stage="cleanup", result="cleanup_error", step=steps, extra={
                     "err": traceback.format_exc()
                 }, max_logs=int(payload.debug_max_logs or 0))
+        elif payload.cleanup_after_done and files_unique_count > 0:
+            push_log(stage="cleanup", result="preserve_files_skip", step=steps, extra={
+                "bot_username": payload.bot_username,
+                "files_unique_count": files_unique_count,
+                "cleanup_min_mid": int(cleanup_min_mid or 0),
+                "cleanup_max_mid": int(cleanup_max_mid or 0),
+            }, max_logs=int(payload.debug_max_logs or 0))
 
         return result
 
@@ -5477,6 +5552,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
                     limit=int(payload.cleanup_limit or 0),
                     min_message_id=int(cleanup_min_mid or 0),
                     max_message_id=int(cleanup_max_mid or 0),
+                    preserve_file_messages=True,
                     max_logs=int(payload.debug_max_logs or 0)
                 )
             except Exception:
@@ -5605,7 +5681,8 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
                     await _cleanup_not_found_messages(
                         payload.bot_username,
                         latest_any,
-                        min_message_id=int(cleanup_min_mid or 0)
+                        min_message_id=int(cleanup_min_mid or 0),
+                        sent_message_id=int(cleanup_min_mid or 0)
                     )
                     timeline.append({
                         "step": steps,
