@@ -49,6 +49,55 @@ def _clear_debug_logs():
     except Exception:
         pass
 
+
+def _is_disconnected_error(err: Exception) -> bool:
+    text = str(err or "").strip().lower()
+    if not text:
+        return False
+    return (
+        "cannot send requests while disconnected" in text
+        or "disconnected" in text
+        or "connection was closed" in text
+        or "not connected" in text
+    )
+
+
+async def _ensure_client_connected(force_reconnect: bool = False) -> bool:
+    try:
+        is_connected = bool(client.is_connected())
+    except Exception:
+        is_connected = False
+
+    if is_connected and not force_reconnect:
+        return True
+
+    if is_connected and force_reconnect:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    try:
+        await client.connect()
+    except Exception as e:
+        push_log(stage="client_connect", result="connect_error", extra={"error": str(e), "trace": traceback.format_exc()[:1200]})
+        return False
+
+    try:
+        if client.is_connected():
+            push_log(stage="client_connect", result="ok", extra={"force_reconnect": bool(force_reconnect)})
+            return True
+    except Exception:
+        pass
+
+    try:
+        await client.start()
+        push_log(stage="client_connect", result="start_ok", extra={"force_reconnect": bool(force_reconnect)})
+        return bool(client.is_connected())
+    except Exception as e:
+        push_log(stage="client_connect", result="start_error", extra={"error": str(e), "trace": traceback.format_exc()[:1200]})
+        return False
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -1774,11 +1823,23 @@ async def _get_peer_for_bot(bot_username: str):
         return None
     if key in _PEER_CACHE:
         return _PEER_CACHE[key]
+    if not await _ensure_client_connected():
+        return None
     try:
         peer = await client.get_input_entity(key)
         _PEER_CACHE[key] = peer
         return peer
     except Exception as e:
+        if _is_disconnected_error(e):
+            _PEER_CACHE.pop(key, None)
+            if await _ensure_client_connected(force_reconnect=True):
+                try:
+                    peer = await client.get_input_entity(key)
+                    _PEER_CACHE[key] = peer
+                    return peer
+                except Exception as retry_error:
+                    push_log(stage="peer_resolve", result="retry_error", extra={"bot_username": key, "error": str(retry_error), "trace": traceback.format_exc()[:1200]})
+                    return None
         push_log(stage="peer_resolve", result="error", extra={"bot_username": key, "error": str(e), "trace": traceback.format_exc()[:1200]})
         return None
 
@@ -2365,6 +2426,9 @@ async def download_all_media_from_chat(payload: DownloadAllMediaRequest):
     if not bot_username:
         return {"status": "error", "message": "bot_username_required"}
 
+    if not await _ensure_client_connected():
+        return {"status": "error", "message": "client_disconnected"}
+
     peer = await _get_peer_for_bot(bot_username)
     if peer is None:
         return {"status": "error", "message": "bot_not_found"}
@@ -2395,45 +2459,58 @@ async def download_all_media_from_chat(payload: DownloadAllMediaRequest):
     files: List[Dict[str, Any]] = []
     scanned = 0
 
-    try:
-        async for msg in client.iter_messages(peer, limit=limit):
-            scanned = scanned + 1
+    for attempt in (1, 2):
+        try:
+            async for msg in client.iter_messages(peer, limit=limit):
+                scanned = scanned + 1
 
-            try:
-                if (not bool(payload.include_out)) and bool(getattr(msg, "out", False)):
+                try:
+                    if (not bool(payload.include_out)) and bool(getattr(msg, "out", False)):
+                        continue
+                    if getattr(msg, "media", None) is None:
+                        continue
+                except Exception:
                     continue
-                if getattr(msg, "media", None) is None:
+
+                fm = _extract_file_meta_mtproto(msg)
+                if not fm:
                     continue
-            except Exception:
-                continue
 
-            fm = _extract_file_meta_mtproto(msg)
-            if not fm:
-                continue
+                files.append(fm)
 
-            files.append(fm)
+                if len(files) % 100 == 0:
+                    job = DOWNLOAD_JOBS.get(job_id) or {}
+                    job["status"] = "collecting"
+                    job["total"] = len(files)
+                    job["scanned_messages"] = scanned
+                    DOWNLOAD_JOBS[job_id] = job
 
-            if len(files) % 100 == 0:
-                job = DOWNLOAD_JOBS.get(job_id) or {}
-                job["status"] = "collecting"
-                job["total"] = len(files)
-                job["scanned_messages"] = scanned
-                DOWNLOAD_JOBS[job_id] = job
+            break
 
-    except FloodWaitError as e:
-        wait_s = int(getattr(e, "seconds", 5) or 5)
-        job = DOWNLOAD_JOBS.get(job_id) or {}
-        job["status"] = "fail"
-        job["last_error"] = f"FloodWaitError: {wait_s}"
-        DOWNLOAD_JOBS[job_id] = job
-        return {"status": "error", "job_id": job_id, "message": "flood_wait", "seconds": wait_s}
+        except FloodWaitError as e:
+            wait_s = int(getattr(e, "seconds", 5) or 5)
+            job = DOWNLOAD_JOBS.get(job_id) or {}
+            job["status"] = "fail"
+            job["last_error"] = f"FloodWaitError: {wait_s}"
+            DOWNLOAD_JOBS[job_id] = job
+            return {"status": "error", "job_id": job_id, "message": "flood_wait", "seconds": wait_s}
 
-    except Exception as e:
-        job = DOWNLOAD_JOBS.get(job_id) or {}
-        job["status"] = "fail"
-        job["last_error"] = str(e)
-        DOWNLOAD_JOBS[job_id] = job
-        return {"status": "error", "job_id": job_id, "message": "collect_failed"}
+        except Exception as e:
+            if attempt == 1 and _is_disconnected_error(e):
+                push_log(stage="download_collect", result="retry_after_reconnect", extra={"bot_username": bot_username, "error": str(e)})
+                _PEER_CACHE.pop(bot_username, None)
+                files = []
+                scanned = 0
+                if await _ensure_client_connected(force_reconnect=True):
+                    peer = await _get_peer_for_bot(bot_username)
+                    if peer is not None:
+                        continue
+
+            job = DOWNLOAD_JOBS.get(job_id) or {}
+            job["status"] = "fail"
+            job["last_error"] = str(e)
+            DOWNLOAD_JOBS[job_id] = job
+            return {"status": "error", "job_id": job_id, "message": "collect_failed"}
 
     files.reverse()
 
