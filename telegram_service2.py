@@ -2384,6 +2384,79 @@ async def _download_one_file_by_message_id(
                 await asyncio.sleep(float(slow_seconds))
 
 
+async def _download_group_message_media_to_local(
+    peer_id: int,
+    message_id: int,
+    folder_label: Optional[str] = None
+) -> Dict[str, Any]:
+    ent = await _resolve_any_entity_by_id(peer_id)
+    if ent is None:
+        return {
+            "status": "fail",
+            "reason": "entity_not_found",
+            "peer_id": int(peer_id),
+            "message_id": int(message_id),
+        }
+
+    group_title = getattr(ent, "title", None) or getattr(ent, "first_name", None) or getattr(ent, "username", None)
+
+    msg = await client.get_messages(ent, ids=int(message_id))
+    if msg is None:
+        return {
+            "status": "fail",
+            "reason": "message_not_found",
+            "peer_id": int(peer_id),
+            "message_id": int(message_id),
+            "group_title": group_title,
+        }
+
+    file_obj = _extract_file_meta_mtproto(msg)
+    if not file_obj:
+        return {
+            "status": "ok",
+            "downloaded": False,
+            "reason": "no_media",
+            "peer_id": int(peer_id),
+            "message_id": int(message_id),
+            "group_title": group_title,
+        }
+
+    label = str(folder_label or "").strip()
+    if not label:
+        title_for_path = str(group_title or f"group_{int(peer_id)}").strip()
+        label = f"group_{int(peer_id)}_{title_for_path}"
+
+    folder_path = _ensure_download_folder_for_text(label)
+    job_id = f"group-download-{int(peer_id)}-{int(message_id)}-{uuid.uuid4().hex}"
+    file_path = _reserve_download_file_path(
+        folder_path=folder_path,
+        file_obj=file_obj,
+        base_name=str(file_obj.get("file_name") or f"message_{int(message_id)}"),
+        index=1,
+        job_id=job_id,
+    )
+
+    await client.download_media(msg, file=file_path)
+
+    return {
+        "status": "ok",
+        "downloaded": True,
+        "peer_id": int(peer_id),
+        "message_id": int(message_id),
+        "group_title": group_title,
+        "folder_path": folder_path,
+        "saved_path": file_path,
+        "saved_name": os.path.basename(file_path),
+        "file": {
+            "file_name": file_obj.get("file_name"),
+            "mime_type": file_obj.get("mime_type"),
+            "file_size": int(file_obj.get("file_size", 0) or 0),
+            "file_type": file_obj.get("file_type"),
+            "file_unique_id": file_obj.get("file_unique_id"),
+        },
+    }
+
+
 
 def _zip_folder_to_file(folder_path: str, zip_path: str) -> None:
     try:
@@ -5340,6 +5413,48 @@ async def get_group_message_by_id(
         "count": len(items),
         "items": items
     }
+
+
+class GroupMessageDownloadRequest(BaseModel):
+    peer_id: int
+    message_id: int
+    folder_label: Optional[str] = None
+
+
+@app.post("/groups/download-message-media")
+async def download_group_message_media(payload: GroupMessageDownloadRequest):
+    try:
+        result = await _download_group_message_media_to_local(
+            peer_id=int(payload.peer_id),
+            message_id=int(payload.message_id),
+            folder_label=payload.folder_label,
+        )
+        push_log(
+            stage="group_download",
+            result="ok" if bool(result.get("downloaded")) else str(result.get("reason") or result.get("status") or "ok"),
+            extra=_json_sanitize(result),
+        )
+        return result
+    except Exception as e:
+        push_log(
+            stage="group_download",
+            result="error",
+            extra={
+                "peer_id": int(payload.peer_id),
+                "message_id": int(payload.message_id),
+                "error": str(e),
+                "trace": traceback.format_exc()[:800],
+            },
+        )
+        return {
+            "status": "fail",
+            "reason": "download_error",
+            "peer_id": int(payload.peer_id),
+            "message_id": int(payload.message_id),
+            "error": str(e),
+        }
+
+
 @app.get("/bots/dialogs")
 async def list_bot_dialogs(limit: int = 300):
     items: List[Dict[str, Any]] = []
