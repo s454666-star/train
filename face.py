@@ -381,6 +381,26 @@ class FaceExtractorApp:
         abs_path = os.path.abspath(path)
         os.makedirs(abs_path, exist_ok=True)
 
+    def build_output_video_name(self, output_dir: str, original_video_path: str) -> str:
+        output_base_name = os.path.basename(os.path.abspath(output_dir))
+        original_ext = os.path.splitext(original_video_path)[1].lower() or ".mp4"
+        return self.sanitize_filename(f"{output_base_name}{original_ext}")
+
+    def move_video_to_output_dir(self, source_video_path: str, output_dir: str) -> str:
+        destination_name = self.build_output_video_name(output_dir, source_video_path)
+        destination_path = os.path.abspath(os.path.join(output_dir, destination_name))
+        if os.path.exists(destination_path):
+            raise FileExistsError(f"輸出影片已存在: {destination_path}")
+        shutil.move(source_video_path, destination_path)
+        return destination_path
+
+    def copy_video_to_retry_dir(self, source_video_path: str) -> str:
+        retry_dir = os.path.abspath(r"Z:\video(重跑)")
+        self.ensure_dir(retry_dir)
+        retry_path = os.path.abspath(os.path.join(retry_dir, os.path.basename(source_video_path)))
+        shutil.copy2(source_video_path, retry_path)
+        return retry_path
+
     # ===== 事件/UI =====
 
     def _on_window_close(self):
@@ -584,6 +604,7 @@ class FaceExtractorApp:
             parent_dir = os.path.dirname(video_path)
             output_dir = self.get_unique_output_dir_starting_from_1(parent_dir, clean_folder_name)
             output_dir = os.path.abspath(output_dir)
+            output_video_name = self.build_output_video_name(output_dir, video_path)
 
             try:
                 LOGGER.info("開始處理影片 index=%s/%s path=%s", self.current_index + 1, max(len(self.video_list), 1), video_path)
@@ -635,8 +656,8 @@ class FaceExtractorApp:
                             INSERT INTO video_master (video_name, video_path, duration, video_type)
                             VALUES (%s, %s, %s, %s)
                         """
-                        relative_video_path = f"\\{os.path.basename(output_dir)}\\{video_name}"
-                        self.db_cursor.execute(insert_video, (video_name, relative_video_path, round(duration, 2), video_type))
+                        relative_video_path = f"\\{os.path.basename(output_dir)}\\{output_video_name}"
+                        self.db_cursor.execute(insert_video, (output_video_name, relative_video_path, round(duration, 2), video_type))
                         self.db_connection.commit()
                         video_master_id = self.db_cursor.lastrowid
                         print(f"已插入 video_master, ID: {video_master_id}")
@@ -761,11 +782,14 @@ class FaceExtractorApp:
                 print(f"完成處理影片: {video_path}")
 
                 try:
-                    destination_path = os.path.abspath(os.path.join(output_dir, os.path.basename(video_path)))
-                    if not os.path.exists(destination_path):
+                    destination_path = self.move_video_to_output_dir(video_path, output_dir)
+                    print(f"撌脩宏?蔣??獢: {destination_path}")
+                    retry_copy_path = self.copy_video_to_retry_dir(destination_path)
+                    print(f"撌脩恍?蔣??銝剜??? Z:\\video(重跑): {retry_copy_path}")
+                    if False:
                         shutil.move(video_path, destination_path)
                         print(f"已移動影片檔案至: {destination_path}")
-                    else:
+                    elif False:
                         base, ext = os.path.splitext(os.path.basename(video_path))
                         k = 1
                         while True:
