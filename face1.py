@@ -12,6 +12,7 @@ import re
 import traceback
 import shutil
 import mysql.connector
+from db_env import load_db_config
 
 class FaceExtractorApp:
     def __init__(self, root):
@@ -83,18 +84,17 @@ class FaceExtractorApp:
 
         # 初始化資料庫連線
         try:
-            self.db_connection = mysql.connector.connect(
-                host="mysql.mystar.monster",
-                port=3306,
-                user="s454666",
-                password="i06180318",
-                database="star"
-            )
+            self.db_connection = mysql.connector.connect(**load_db_config(prefix="FACE"))
             self.db_cursor = self.db_connection.cursor()
             print("成功連接到資料庫")
         except mysql.connector.Error as err:
             print(f"資料庫連線錯誤: {err}")
             messagebox.showerror("資料庫錯誤", f"無法連接到資料庫: {err}")
+            self.db_connection = None
+            self.db_cursor = None
+        except ValueError as err:
+            print(f"資料庫 ENV 設定錯誤: {err}")
+            messagebox.showerror("資料庫 ENV 設定錯誤", str(err))
             self.db_connection = None
             self.db_cursor = None
 

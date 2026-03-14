@@ -4,15 +4,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
-
-DB_CONFIG = {
-    "host": "mysql.mystar.monster",
-    "user": "s454666",
-    "password": "i06180318",
-    "database": "star",
-    "port": 3306,
-    "charset": "utf8mb4"
-}
+from db_env import load_db_config
 
 
 def create_driver():
@@ -25,7 +17,7 @@ def create_driver():
 
 
 def connect_db():
-    return pymysql.connect(**DB_CONFIG)
+    return pymysql.connect(**load_db_config(prefix="BTDIG", charset="utf8mb4"))
 
 
 def keyword_exists(conn, keyword):

@@ -28,6 +28,7 @@ import platform
 
 from typing import Optional, List, Dict, Any, Tuple, Set
 from datetime import datetime, date
+from db_env import load_db_config
 
 
 # ===== OpenCV 穩定性設定（只為降低偶發 native crash，不影響功能）=====
@@ -271,23 +272,24 @@ class FaceExtractorApp:
             self._haar_face = None
 
         try:
-            LOGGER.info("準備連接資料庫 host=%s port=%s database=%s", "mysql.mystar.monster", 3306, "star")
+            db_config = load_db_config(prefix="FACE")
+            LOGGER.info("準備連接資料庫 host=%s port=%s database=%s", db_config["host"], db_config["port"], db_config["database"])
             _flush_logs()
         except Exception:
             pass
         try:
-            self.db_connection = mysql.connector.connect(
-                host="mysql.mystar.monster",
-                port=3306,
-                user="s454666",
-                password="i06180318",
-                database="star"
-            )
+            db_config = load_db_config(prefix="FACE")
+            self.db_connection = mysql.connector.connect(**db_config)
             self.db_cursor = self.db_connection.cursor()
             print("成功連接到資料庫")
         except mysql.connector.Error as err:
             print(f"資料庫連線錯誤: {err}")
             self._update_current_file(f"資料庫連線失敗：{err}")
+            self.db_connection = None
+            self.db_cursor = None
+        except ValueError as err:
+            print(f"資料庫 ENV 設定錯誤: {err}")
+            self._update_current_file(f"資料庫 ENV 設定錯誤：{err}")
             self.db_connection = None
             self.db_cursor = None
 
