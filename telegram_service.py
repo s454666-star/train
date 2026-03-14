@@ -4170,21 +4170,6 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
     cleanup_min_mid = 0
     cleanup_max_mid = 0
 
-    download_job_id = uuid.uuid4().hex
-    folder_path = _ensure_download_folder_for_text(payload.text)
-    DOWNLOAD_JOBS[download_job_id] = {
-        "status": "pending",
-        "created_at_s": _now_s(),
-        "bot_username": payload.bot_username,
-        "folder_path": folder_path,
-        "base_name": payload.text,
-        "total": 0,
-        "done": 0,
-        "failed": 0,
-        "last_saved_path": None,
-        "last_error": None,
-    }
-
     def _attach_files(resp: Dict[str, Any]) -> Dict[str, Any]:
         if not payload.include_files_in_response:
             return resp
@@ -4201,7 +4186,6 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             "last_clicked_page": last_clicked_page,
             "last_clicked_desc": last_clicked_desc
         }
-        resp["download"] = {"job_id": download_job_id, "folder_path": folder_path, "base_name": payload.text}
         return resp
 
     def _freeze_cleanup_window() -> None:
@@ -4230,21 +4214,8 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         except Exception as e:
             push_log(stage="cleanup", result="exception", extra={"error": str(e), "trace": traceback.format_exc()[:900]})
 
-    async def _start_background_download_and_cleanup():
-        meta = collect_files_from_store(payload.bot_username, int(payload.max_return_files), int(payload.max_raw_payload_bytes))
-        files = meta.get("files") or []
-        job = DOWNLOAD_JOBS.get(download_job_id) or {}
-        job["total"] = len(files)
-        job["status"] = "queued" if files else "done"
-        DOWNLOAD_JOBS[download_job_id] = job
-
-        if files:
-            try:
-                await _background_download_files(payload.bot_username, files, folder_path, payload.text, download_job_id, slow_seconds=0.8)
-            finally:
-                await _maybe_cleanup()
-        else:
-            await _maybe_cleanup()
+    async def _start_background_cleanup():
+        await _maybe_cleanup()
 
     async def _return_ok(reason: str) -> Dict[str, Any]:
         timeline.append({"step": steps, "status": "done", "reason": reason})
@@ -4258,7 +4229,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             max_raw_payload_bytes=int(payload.max_raw_payload_bytes or 0),
             min_message_id=int(cleanup_min_mid or 0)
         )
-        asyncio.create_task(_start_background_download_and_cleanup())
+        asyncio.create_task(_start_background_cleanup())
         return resp
 
     async def _return_fail(reason: str, error: Optional[str] = None) -> Dict[str, Any]:
@@ -4275,7 +4246,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             max_raw_payload_bytes=int(payload.max_raw_payload_bytes or 0),
             min_message_id=int(cleanup_min_mid or 0)
         )
-        asyncio.create_task(_start_background_download_and_cleanup())
+        asyncio.create_task(_start_background_cleanup())
         return resp
 
     async def _sleep_after_pagination_click() -> None:
