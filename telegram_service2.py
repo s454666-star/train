@@ -14,6 +14,7 @@ import time
 import traceback
 import zipfile
 import os
+import subprocess
 from typing import Optional, List, Dict, Any, Tuple, Set
 from datetime import datetime, date
 
@@ -42,6 +43,10 @@ DOWNLOAD_RESERVED_PATHS_BY_JOB: Dict[str, Set[str]] = {}
 DOWNLOAD_JOBS: Dict[str, Dict[str, Any]] = {}
 DOWNLOAD_SEEN_KEYS: Set[str] = set()
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
+
+TDL_EXE_PATH = r"C:\Users\User\Videos\Captures\tdl.exe"
+TDL_DOWNLOAD_THREADS = 12
+TDL_DOWNLOAD_LIMIT = 12
 
 def _clear_debug_logs():
     try:
@@ -2271,6 +2276,133 @@ def _ensure_download_folder_for_media(text: str, file_type: Optional[str], mime_
     return target_folder
 
 
+def _run_tdl_download(
+    peer_id: int,
+    message_id: int,
+    folder_path: str,
+    reserved_path: str
+) -> Dict[str, Any]:
+    exe_path = str(TDL_EXE_PATH or "").strip()
+    if not exe_path or not os.path.isfile(exe_path):
+        return {
+            "ok": False,
+            "reason": "tdl_missing",
+            "exe_path": exe_path,
+        }
+
+    os.makedirs(folder_path, exist_ok=True)
+    before_entries: Set[str] = set()
+    try:
+        before_entries = set(os.listdir(folder_path))
+    except Exception:
+        before_entries = set()
+
+    url = f"https://t.me/c/{int(peer_id)}/{int(message_id)}"
+    cmd = [
+        exe_path,
+        "dl",
+        "-u",
+        url,
+        "-d",
+        folder_path,
+        "-t",
+        str(TDL_DOWNLOAD_THREADS),
+        "-l",
+        str(TDL_DOWNLOAD_LIMIT),
+        "--skip-same",
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": "tdl_exec_error",
+            "error": str(e),
+        }
+
+    stdout = str(proc.stdout or "")
+    stderr = str(proc.stderr or "")
+    after_paths: List[str] = []
+
+    try:
+        for name in os.listdir(folder_path):
+            if name in before_entries:
+                continue
+            full_path = os.path.join(folder_path, name)
+            if os.path.isfile(full_path):
+                after_paths.append(full_path)
+    except Exception:
+        after_paths = []
+
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "reason": "tdl_failed",
+            "returncode": int(proc.returncode),
+            "stdout": stdout[-2000:],
+            "stderr": stderr[-2000:],
+        }
+
+    if not after_paths:
+        if os.path.isfile(reserved_path):
+            return {
+                "ok": True,
+                "saved_path": reserved_path,
+                "saved_name": os.path.basename(reserved_path),
+                "stdout": stdout[-1000:],
+                "stderr": stderr[-1000:],
+            }
+        return {
+            "ok": False,
+            "reason": "tdl_no_new_file",
+            "stdout": stdout[-2000:],
+            "stderr": stderr[-2000:],
+        }
+
+    after_paths.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    downloaded_path = after_paths[0]
+
+    final_path = reserved_path
+    try:
+        if os.path.normcase(downloaded_path) != os.path.normcase(final_path):
+            if os.path.isfile(final_path):
+                os.remove(final_path)
+            os.replace(downloaded_path, final_path)
+            for extra_path in after_paths[1:]:
+                try:
+                    if os.path.isfile(extra_path):
+                        os.remove(extra_path)
+                except Exception:
+                    pass
+        else:
+            final_path = downloaded_path
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": "tdl_rename_failed",
+            "downloaded_path": downloaded_path,
+            "target_path": final_path,
+            "error": str(e),
+            "stdout": stdout[-2000:],
+            "stderr": stderr[-2000:],
+        }
+
+    return {
+        "ok": True,
+        "saved_path": final_path,
+        "saved_name": os.path.basename(final_path),
+        "stdout": stdout[-1000:],
+        "stderr": stderr[-1000:],
+    }
+
+
 def _guess_ext_from_name_or_mime(file_name: Optional[str], mime_type: Optional[str]) -> str:
     fn = (file_name or "").strip().lower()
     if "." in fn:
@@ -2458,7 +2590,20 @@ async def _download_group_message_media_to_local(
         job_id=job_id,
     )
 
-    await client.download_media(msg, file=file_path)
+    downloader = "telethon"
+    tdl_result = await asyncio.to_thread(
+        _run_tdl_download,
+        int(peer_id),
+        int(message_id),
+        folder_path,
+        file_path,
+    )
+
+    if bool(tdl_result.get("ok")):
+        downloader = "tdl"
+        file_path = str(tdl_result.get("saved_path") or file_path)
+    else:
+        await client.download_media(msg, file=file_path)
 
     return {
         "status": "ok",
@@ -2469,6 +2614,8 @@ async def _download_group_message_media_to_local(
         "folder_path": folder_path,
         "saved_path": file_path,
         "saved_name": os.path.basename(file_path),
+        "downloader": downloader,
+        "tdl": _json_sanitize(tdl_result),
         "file": {
             "file_name": file_obj.get("file_name"),
             "mime_type": file_obj.get("mime_type"),
