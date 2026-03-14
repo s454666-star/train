@@ -3820,9 +3820,10 @@ async def _observe_no_controls_and_collect_files(
             except Exception:
                 pass
 
-        if try_send_get_all and (not sent_get_all) and elapsed >= 1.0:
+        if try_send_get_all and (not sent_get_all) and elapsed >= 1.0 and int(best_count) <= 0:
             try:
                 await client.send_message(bot_username, get_all_command)
+                push_log(stage="observe_no_controls", result="sent_get_all", step=step, extra={"best_count": int(best_count), "command": get_all_command}, max_logs=max_logs)
                 sent_get_all = True
             except Exception:
                 pass
