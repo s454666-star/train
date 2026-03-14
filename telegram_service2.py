@@ -1996,6 +1996,20 @@ async def _cleanup_chat_after_run(
             push_log(stage="cleanup", result="delete_history_error", extra={"error": str(e), "trace": traceback.format_exc()[:800]}, max_logs=max_logs)
         return
 
+    push_log(
+        stage="cleanup_snapshot",
+        result="before_range_delete",
+        extra={
+            "bot_username": bot_username,
+            "scope": scope,
+            "min_mid": lower_bound,
+            "max_mid": upper_bound,
+            "store_recent": _recent_store_snapshot(bot_username, limit=8, min_message_id=max(lower_bound - 3, 0)),
+            "live_recent": await _recent_live_snapshot(bot_username, limit=8),
+        },
+        max_logs=max_logs,
+    )
+
     ids: List[int] = []
     try:
         async for msg in client.iter_messages(peer, limit=max(int(limit or 300), 50)):
@@ -2019,6 +2033,20 @@ async def _cleanup_chat_after_run(
     ids_sorted = sorted(ids)
     push_log(stage="cleanup", result="collected", extra={"scope": "run", "count": len(ids_sorted), "from": ids_sorted[0], "to": ids_sorted[-1], "min_mid": lower_bound, "max_mid": upper_bound}, max_logs=max_logs)
     await _delete_messages_in_batches(bot_username, ids_sorted, revoke=True)
+    push_log(
+        stage="cleanup_snapshot",
+        result="after_range_delete",
+        extra={
+            "bot_username": bot_username,
+            "scope": scope,
+            "deleted_message_ids": ids_sorted[:120],
+            "min_mid": lower_bound,
+            "max_mid": upper_bound,
+            "store_recent": _recent_store_snapshot(bot_username, limit=8, min_message_id=max(lower_bound - 3, 0)),
+            "live_recent": await _recent_live_snapshot(bot_username, limit=8),
+        },
+        max_logs=max_logs,
+    )
 
 
 async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[Dict[str, Any]], min_message_id: int = 0):
@@ -2064,15 +2092,92 @@ async def _cleanup_not_found_messages(bot_username: str, trigger_msg: Optional[D
             "trigger_message_id": trigger_mid,
             "reply_to_message_id": reply_mid,
             "fallback_min_message_id": run_floor_mid,
+            "trigger_message": _message_debug_summary(msg),
+            "store_recent": _recent_store_snapshot(bot_username, limit=8, min_message_id=max(run_floor_mid - 3, 0)),
+            "live_recent": await _recent_live_snapshot(bot_username, limit=8),
         }
     )
     await _delete_messages_in_batches(bot_username, deduped, revoke=True)
+    push_log(
+        stage="cleanup_not_found",
+        result="delete_targeted_done",
+        extra={
+            "bot_username": bot_username,
+            "message_ids": deduped,
+            "store_recent": _recent_store_snapshot(bot_username, limit=8, min_message_id=max(run_floor_mid - 3, 0)),
+            "live_recent": await _recent_live_snapshot(bot_username, limit=8),
+        }
+    )
 
 def _get_debug_logs(limit: int = 200) -> List[Dict[str, Any]]:
     try:
         return DEBUG_LOGS[-max(int(limit or 200), 1):]
     except Exception:
         return []
+
+
+def _message_debug_summary(msg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not msg:
+        return None
+
+    text = str(msg.get("text") or "").replace("\r", " ").replace("\n", " ").strip()
+    buttons = get_callback_buttons(msg)
+
+    return {
+        "message_id": int(msg.get("message_id", 0) or 0),
+        "reply_to_message_id": int(msg.get("reply_to_message_id", 0) or 0),
+        "chat_id": int(msg.get("chat_id", 0) or 0),
+        "bot_username": msg.get("bot_username"),
+        "sender_username": msg.get("sender_username"),
+        "has_file": bool(msg.get("file")),
+        "has_buttons": bool(buttons),
+        "buttons_text": summarize_buttons(buttons) if buttons else "",
+        "text_preview": text[:180],
+        "date": msg.get("date"),
+    }
+
+
+def _recent_store_snapshot(bot_username: str, limit: int = 8, min_message_id: int = 0) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for msg in get_all_messages_sorted():
+        if not _message_matches_bot(msg, bot_username):
+            continue
+        mid = int(msg.get("message_id", 0) or 0)
+        if int(min_message_id or 0) > 0 and mid < int(min_message_id or 0):
+            continue
+        summary = _message_debug_summary(msg)
+        if summary:
+            items.append(summary)
+
+    if limit > 0:
+        items = items[-limit:]
+    return items
+
+
+async def _recent_live_snapshot(bot_username: str, limit: int = 8) -> List[Dict[str, Any]]:
+    peer = await _get_peer_for_bot(bot_username)
+    if peer is None:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    try:
+        async for msg in client.iter_messages(peer, limit=max(int(limit or 8), 1)):
+            try:
+                text = str(getattr(msg, "text", "") or "").replace("\r", " ").replace("\n", " ").strip()
+                out.append({
+                    "message_id": int(getattr(msg, "id", 0) or 0),
+                    "reply_to_message_id": int(getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", 0) or 0),
+                    "has_file": bool(getattr(msg, "media", None)),
+                    "text_preview": text[:180],
+                    "date": getattr(msg, "date", None).isoformat() if getattr(msg, "date", None) else None,
+                })
+            except Exception:
+                continue
+    except Exception as e:
+        return [{"_error": str(e)}]
+
+    out.reverse()
+    return out
 
 def _sanitize_for_path(s: str, max_len: int = 80) -> str:
     s = (s or "").strip()
@@ -4346,6 +4451,20 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             cleanup_min_mid = 0
         if int(cleanup_min_mid or 0) <= 0:
             cleanup_min_mid = int(before_mid_pre_send or 0)
+        push_log(
+            stage="run_send",
+            result="sent",
+            step=0,
+            extra={
+                "bot_username": payload.bot_username,
+                "text": str(payload.text or "")[:180],
+                "before_mid_pre_send": int(before_mid_pre_send or 0),
+                "sent_message_id": int(getattr(sent, "id", 0) or 0),
+                "cleanup_min_mid": int(cleanup_min_mid or 0),
+                "store_recent": _recent_store_snapshot(payload.bot_username, limit=6, min_message_id=max(int(cleanup_min_mid or 0) - 3, 0)),
+            },
+            max_logs=payload.debug_max_logs,
+        )
 
         first_any = await wait_for_first_bot_message(
             bot_username=payload.bot_username,
@@ -4357,6 +4476,17 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         )
         if not first_any:
             return await _return_fail("timeout waiting for first bot message after sending")
+        push_log(
+            stage="run_first_message",
+            result="received",
+            step=0,
+            extra={
+                "bot_username": payload.bot_username,
+                "first_message": _message_debug_summary(first_any),
+                "store_recent": _recent_store_snapshot(payload.bot_username, limit=8, min_message_id=max(int(cleanup_min_mid or 0) - 3, 0)),
+            },
+            max_logs=payload.debug_max_logs,
+        )
 
         if _is_bot_not_found_message(first_any):
             background_cleanup_enabled = False
