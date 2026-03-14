@@ -386,21 +386,6 @@ class FaceExtractorApp:
         original_ext = os.path.splitext(original_video_path)[1].lower() or ".mp4"
         return self.sanitize_filename(f"{output_base_name}{original_ext}")
 
-    def move_video_to_output_dir(self, source_video_path: str, output_dir: str) -> str:
-        destination_name = self.build_output_video_name(output_dir, source_video_path)
-        destination_path = os.path.abspath(os.path.join(output_dir, destination_name))
-        if os.path.exists(destination_path):
-            raise FileExistsError(f"輸出影片已存在: {destination_path}")
-        shutil.move(source_video_path, destination_path)
-        return destination_path
-
-    def copy_video_to_retry_dir(self, source_video_path: str) -> str:
-        retry_dir = os.path.abspath(r"Z:\video(重跑)")
-        self.ensure_dir(retry_dir)
-        retry_path = os.path.abspath(os.path.join(retry_dir, os.path.basename(source_video_path)))
-        shutil.copy2(source_video_path, retry_path)
-        return retry_path
-
     # ===== 事件/UI =====
 
     def _on_window_close(self):
@@ -782,23 +767,18 @@ class FaceExtractorApp:
                 print(f"完成處理影片: {video_path}")
 
                 try:
-                    destination_path = self.move_video_to_output_dir(video_path, output_dir)
-                    print(f"撌脩宏?蔣??獢: {destination_path}")
-                    retry_copy_path = self.copy_video_to_retry_dir(destination_path)
-                    print(f"撌脩恍?蔣??銝剜??? Z:\\video(重跑): {retry_copy_path}")
-                    if False:
-                        shutil.move(video_path, destination_path)
-                        print(f"已移動影片檔案至: {destination_path}")
-                    elif False:
-                        base, ext = os.path.splitext(os.path.basename(video_path))
-                        k = 1
-                        while True:
-                            candidate = os.path.abspath(os.path.join(output_dir, f"{base}_{k}{ext}"))
-                            if not os.path.exists(candidate):
-                                shutil.move(video_path, candidate)
-                                print(f"已移動影片檔案至: {candidate}")
-                                break
-                            k += 1
+                    destination_path = os.path.abspath(os.path.join(output_dir, output_video_name))
+                    if os.path.exists(destination_path):
+                        raise FileExistsError(f"輸出影片已存在: {destination_path}")
+
+                    shutil.move(video_path, destination_path)
+                    print(f"已移動影片檔案至: {destination_path}")
+
+                    retry_dir = os.path.abspath(r"Z:\video(重跑)")
+                    self.ensure_dir(retry_dir)
+                    retry_copy_path = os.path.abspath(os.path.join(retry_dir, output_video_name))
+                    shutil.copy2(destination_path, retry_copy_path)
+                    print(f"已複製影片檔案至 Z:\\video(重跑): {retry_copy_path}")
                 except Exception as e:
                     try:
                         LOGGER.exception("移動影片檔案發生錯誤: %s", e)
