@@ -2276,9 +2276,8 @@ def _ensure_download_folder_for_media(text: str, file_type: Optional[str], mime_
     return target_folder
 
 
-def _run_tdl_download(
-    peer_id: int,
-    message_id: int,
+def _run_tdl_download_url(
+    url: str,
     folder_path: str,
     reserved_path: str
 ) -> Dict[str, Any]:
@@ -2297,7 +2296,6 @@ def _run_tdl_download(
     except Exception:
         before_entries = set()
 
-    url = f"https://t.me/c/{int(peer_id)}/{int(message_id)}"
     cmd = [
         exe_path,
         "dl",
@@ -2401,6 +2399,33 @@ def _run_tdl_download(
         "stdout": stdout[-1000:],
         "stderr": stderr[-1000:],
     }
+
+
+def _run_tdl_download(
+    peer_id: int,
+    message_id: int,
+    folder_path: str,
+    reserved_path: str
+) -> Dict[str, Any]:
+    url = f"https://t.me/c/{int(peer_id)}/{int(message_id)}"
+    return _run_tdl_download_url(url, folder_path, reserved_path)
+
+
+def _run_tdl_download_for_bot_message(
+    bot_username: str,
+    message_id: int,
+    folder_path: str,
+    reserved_path: str
+) -> Dict[str, Any]:
+    username = str(bot_username or "").strip().lstrip("@")
+    if not username:
+        return {
+            "ok": False,
+            "reason": "bot_username_missing",
+        }
+
+    url = f"https://t.me/{username}/{int(message_id)}"
+    return _run_tdl_download_url(url, folder_path, reserved_path)
 
 
 def _guess_ext_from_name_or_mime(file_name: Optional[str], mime_type: Optional[str]) -> str:
@@ -2514,14 +2539,38 @@ async def _download_one_file_by_message_id(
                 job_id=job_id
             )
 
-            await client.download_media(one, file=file_path)
+            downloader = "telethon"
+            tdl_result = await asyncio.to_thread(
+                _run_tdl_download_for_bot_message,
+                bot_username,
+                mid,
+                folder_path,
+                file_path,
+            )
+
+            if bool(tdl_result.get("ok")):
+                downloader = "tdl"
+                file_path = str(tdl_result.get("saved_path") or file_path)
+            else:
+                await client.download_media(one, file=file_path)
 
             job = DOWNLOAD_JOBS.get(job_id) or {}
             job["done"] = int(job.get("done", 0)) + 1
             job["last_saved_path"] = file_path
+            job["last_downloader"] = downloader
             DOWNLOAD_JOBS[job_id] = job
 
-            push_log(stage="download_local", result="ok", extra={"job_id": job_id, "mid": mid, "path": file_path})
+            push_log(
+                stage="download_local",
+                result="ok",
+                extra={
+                    "job_id": job_id,
+                    "mid": mid,
+                    "path": file_path,
+                    "downloader": downloader,
+                    "tdl": _json_sanitize(tdl_result),
+                }
+            )
 
         except Exception as e:
             job = DOWNLOAD_JOBS.get(job_id) or {}
@@ -2952,6 +3001,7 @@ class SendAndRunAllPagesRequest(BaseModel):
     bot_username: str
     text: str
     clear_previous_replies: bool = True
+    wait_download_completion: bool = False
     delay_seconds: int = 0
     max_steps: int = 80
 
@@ -4633,6 +4683,20 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
     background_cleanup_enabled = True
     skip_cleanup_due_to_files = False
     skip_cleanup_files_count = 0
+    download_job_id = uuid.uuid4().hex
+    folder_path = _ensure_download_folder_for_text(payload.text)
+    DOWNLOAD_JOBS[download_job_id] = {
+        "status": "pending",
+        "created_at_s": _now_s(),
+        "bot_username": payload.bot_username,
+        "folder_path": folder_path,
+        "base_name": payload.text,
+        "total": 0,
+        "done": 0,
+        "failed": 0,
+        "last_saved_path": None,
+        "last_error": None,
+    }
 
     def _attach_files(resp: Dict[str, Any]) -> Dict[str, Any]:
         if not payload.include_files_in_response:
@@ -4650,6 +4714,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             "last_clicked_page": last_clicked_page,
             "last_clicked_desc": last_clicked_desc
         }
+        resp["download"] = {"job_id": download_job_id, "folder_path": folder_path, "base_name": payload.text}
         return resp
 
     def _freeze_cleanup_window() -> None:
@@ -4671,7 +4736,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             min_message_id=int(cleanup_min_mid or 0),
         )
         current_run_files_count = int(files_meta_for_cleanup.get("files_unique_count", files_meta_for_cleanup.get("files_count", 0)) or 0)
-        if current_run_files_count > 0 or skip_cleanup_due_to_files:
+        if (not payload.wait_download_completion) and (current_run_files_count > 0 or skip_cleanup_due_to_files):
             push_log(
                 stage="cleanup",
                 result="preserve_files_skip",
@@ -4693,14 +4758,39 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
                 str(payload.cleanup_scope or "run"),
                 int(payload.cleanup_limit or 500),
                 max_mid=int(cleanup_max_mid or 0),
-                preserve_file_messages=True,
+                preserve_file_messages=not bool(payload.wait_download_completion),
                 max_logs=int(payload.debug_max_logs or 0),
             )
         except Exception as e:
             push_log(stage="cleanup", result="exception", extra={"error": str(e), "trace": traceback.format_exc()[:900]})
 
-    async def _start_background_cleanup():
-        await _maybe_cleanup()
+    async def _start_background_download_and_cleanup():
+        files_meta = collect_files_from_store(
+            payload.bot_username,
+            int(payload.max_return_files or 0),
+            int(payload.max_raw_payload_bytes or 0),
+            min_message_id=int(cleanup_min_mid or 0),
+        )
+        files = files_meta.get("files") or []
+        job = DOWNLOAD_JOBS.get(download_job_id) or {}
+        job["total"] = len(files)
+        job["status"] = "queued" if files else "done"
+        DOWNLOAD_JOBS[download_job_id] = job
+
+        if files:
+            try:
+                await _background_download_files(
+                    payload.bot_username,
+                    files,
+                    folder_path,
+                    payload.text,
+                    download_job_id,
+                    slow_seconds=0.8,
+                )
+            finally:
+                await _maybe_cleanup()
+        else:
+            await _maybe_cleanup()
 
     async def _return_ok(reason: str) -> Dict[str, Any]:
         nonlocal skip_cleanup_due_to_files, skip_cleanup_files_count
@@ -4717,7 +4807,10 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         )
         skip_cleanup_files_count = int(resp.get("files_unique_count", 0) or 0)
         skip_cleanup_due_to_files = skip_cleanup_files_count > 0
-        asyncio.create_task(_start_background_cleanup())
+        if payload.wait_download_completion:
+            await _start_background_download_and_cleanup()
+        else:
+            asyncio.create_task(_start_background_download_and_cleanup())
         return resp
 
     async def _return_fail(reason: str, error: Optional[str] = None) -> Dict[str, Any]:
@@ -4734,7 +4827,10 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             max_raw_payload_bytes=int(payload.max_raw_payload_bytes or 0),
             min_message_id=int(cleanup_min_mid or 0)
         )
-        asyncio.create_task(_start_background_cleanup())
+        if payload.wait_download_completion:
+            await _start_background_download_and_cleanup()
+        else:
+            asyncio.create_task(_start_background_download_and_cleanup())
         return resp
 
     async def _sleep_after_pagination_click() -> None:
