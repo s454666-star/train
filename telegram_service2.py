@@ -2852,6 +2852,17 @@ async def get_download_jobs(limit: int = 30):
     return out
 
 
+@app.get("/bots/download-jobs/{job_id}")
+async def get_download_job(job_id: str):
+    job = DOWNLOAD_JOBS.get(str(job_id))
+    if not job:
+        return {"status": "error", "message": "job_not_found", "job_id": str(job_id)}
+
+    obj = dict(job)
+    obj["job_id"] = str(job_id)
+    return obj
+
+
 
 class DownloadAllMediaRequest(BaseModel):
     bot_username: str
@@ -4781,7 +4792,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         except Exception as e:
             push_log(stage="cleanup", result="exception", extra={"error": str(e), "trace": traceback.format_exc()[:900]})
 
-    async def _start_background_download_and_cleanup():
+    async def _prepare_download_job_and_maybe_cleanup() -> Dict[str, Any]:
         nonlocal skip_cleanup_due_to_size_limit, skip_cleanup_total_bytes
         files_meta = collect_files_from_store(
             payload.bot_username,
@@ -4823,21 +4834,45 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
                 max_logs=int(payload.debug_max_logs or 0),
             )
             await _maybe_cleanup()
+            return {
+                "mode": "skipped_size_limit",
+                "files": [],
+                "files_count": len(files),
+                "total_bytes": int(total_bytes),
+            }
+
+        if not files:
+            await _maybe_cleanup()
+            return {
+                "mode": "done",
+                "files": [],
+                "files_count": 0,
+                "total_bytes": int(total_bytes),
+            }
+
+        return {
+            "mode": "queued",
+            "files": files,
+            "files_count": len(files),
+            "total_bytes": int(total_bytes),
+        }
+
+    async def _run_prepared_download_and_cleanup(prepared: Dict[str, Any]) -> None:
+        files = prepared.get("files") or []
+        if not files:
+            await _maybe_cleanup()
             return
 
-        if files:
-            try:
-                await _background_download_files(
-                    payload.bot_username,
-                    files,
-                    folder_path,
-                    payload.text,
-                    download_job_id,
-                    slow_seconds=0.8,
-                )
-            finally:
-                await _maybe_cleanup()
-        else:
+        try:
+            await _background_download_files(
+                payload.bot_username,
+                files,
+                folder_path,
+                payload.text,
+                download_job_id,
+                slow_seconds=0.8,
+            )
+        finally:
             await _maybe_cleanup()
 
     async def _return_ok(reason: str) -> Dict[str, Any]:
@@ -4856,12 +4891,18 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         skip_cleanup_files_count = int(resp.get("files_unique_count", 0) or 0)
         skip_cleanup_total_bytes = int(resp.get("files_total_bytes", 0) or 0)
         skip_cleanup_due_to_files = skip_cleanup_files_count > 0
-        if payload.wait_download_completion:
-            await _start_background_download_and_cleanup()
-        else:
-            asyncio.create_task(_start_background_download_and_cleanup())
+        prepared_download = await _prepare_download_job_and_maybe_cleanup()
+        download_resp = resp.get("download") if isinstance(resp.get("download"), dict) else {}
+        download_resp["status"] = str(prepared_download.get("mode") or "")
+        download_resp["total"] = int(prepared_download.get("files_count", 0) or 0)
+        download_resp["files_total_bytes"] = int(prepared_download.get("total_bytes", 0) or 0)
+        resp["download"] = download_resp
+        if str(prepared_download.get("mode") or "") == "queued":
+            if payload.wait_download_completion:
+                await _run_prepared_download_and_cleanup(prepared_download)
+            else:
+                asyncio.create_task(_run_prepared_download_and_cleanup(prepared_download))
         if skip_cleanup_due_to_size_limit:
-            download_resp = resp.get("download") if isinstance(resp.get("download"), dict) else {}
             download_resp["skipped"] = True
             download_resp["reason"] = "total_bytes_exceeded"
             download_resp["limit_bytes"] = int(payload.skip_download_if_total_bytes_exceeds or 0)
@@ -4886,10 +4927,26 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             max_raw_payload_bytes=int(payload.max_raw_payload_bytes or 0),
             min_message_id=int(cleanup_min_mid or 0)
         )
-        if payload.wait_download_completion:
-            await _start_background_download_and_cleanup()
-        else:
-            asyncio.create_task(_start_background_download_and_cleanup())
+        prepared_download = await _prepare_download_job_and_maybe_cleanup()
+        download_resp = resp.get("download") if isinstance(resp.get("download"), dict) else {}
+        download_resp["status"] = str(prepared_download.get("mode") or "")
+        download_resp["total"] = int(prepared_download.get("files_count", 0) or 0)
+        download_resp["files_total_bytes"] = int(prepared_download.get("total_bytes", 0) or 0)
+        resp["download"] = download_resp
+        if str(prepared_download.get("mode") or "") == "queued":
+            if payload.wait_download_completion:
+                await _run_prepared_download_and_cleanup(prepared_download)
+            else:
+                asyncio.create_task(_run_prepared_download_and_cleanup(prepared_download))
+        if skip_cleanup_due_to_size_limit:
+            download_resp["skipped"] = True
+            download_resp["reason"] = "total_bytes_exceeded"
+            download_resp["limit_bytes"] = int(payload.skip_download_if_total_bytes_exceeds or 0)
+            download_resp["files_total_bytes"] = int(skip_cleanup_total_bytes or 0)
+            resp["download"] = download_resp
+            resp["download_skipped"] = True
+            resp["download_skipped_reason"] = "total_bytes_exceeded"
+            resp["download_skipped_limit_bytes"] = int(payload.skip_download_if_total_bytes_exceeds or 0)
         return resp
 
     async def _sleep_after_pagination_click() -> None:
