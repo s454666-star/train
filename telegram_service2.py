@@ -46,7 +46,7 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
 
 TDL_EXE_PATH = r"C:\Users\User\Videos\Captures\tdl.exe"
 TDL_DOWNLOAD_THREADS = 12
-TDL_DOWNLOAD_LIMIT = 12
+TDL_DOWNLOAD_LIMIT = 32
 
 def _clear_debug_logs():
     try:
