@@ -3019,6 +3019,7 @@ class SendAndRunAllPagesRequest(BaseModel):
     bot_username: str
     text: str
     clear_previous_replies: bool = True
+    download_after_done: bool = True
     wait_download_completion: bool = False
     skip_download_if_total_bytes_exceeds: int = 0
     delay_seconds: int = 0
@@ -4813,6 +4814,18 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         job["total_bytes"] = int(total_bytes)
         job["status"] = "queued" if files else "done"
         DOWNLOAD_JOBS[download_job_id] = job
+
+        if not bool(payload.download_after_done):
+            job["status"] = "disabled"
+            job["reason"] = "download_disabled"
+            DOWNLOAD_JOBS[download_job_id] = job
+            await _maybe_cleanup()
+            return {
+                "mode": "disabled",
+                "files": [],
+                "files_count": len(files),
+                "total_bytes": int(total_bytes),
+            }
 
         download_limit_bytes = int(payload.skip_download_if_total_bytes_exceeds or 0)
         if files and download_limit_bytes > 0 and int(total_bytes) > download_limit_bytes:
