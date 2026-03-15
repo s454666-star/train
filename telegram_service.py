@@ -5097,6 +5097,73 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
                     target_total_items=first_total_items
                 )
                 files_unique_count_observed = int(meta_observed.get("files_unique_count", meta_observed.get("files_count", 0)))
+                if files_unique_count_observed > 0:
+                    await asyncio.sleep(1.2)
+                    await backfill_latest_from_bot(
+                        payload.bot_username,
+                        limit=360,
+                        timeout_seconds=6.0,
+                        max_logs=payload.debug_max_logs,
+                        step=0,
+                        force=True
+                    )
+                    late_state = _choose_best_state_message(
+                        bot_username=payload.bot_username,
+                        next_keywords=payload.next_text_keywords,
+                        max_age_seconds=int(payload.callback_message_max_age_seconds or 0),
+                        scan_limit=int(payload.callback_candidate_scan_limit or 20),
+                        min_message_id=int(cleanup_min_mid or 0)
+                    )
+                    if late_state:
+                        late_buttons = get_callback_buttons(late_state)
+                        late_pi = extract_page_info(late_state.get("text"))
+                        late_is_pagelike = _is_pagination_callback_message(late_state, next_keywords=payload.next_text_keywords) if late_buttons else bool(late_pi)
+                        if late_is_pagelike or late_pi or late_buttons:
+                            chosen_first = late_state
+                            first_buttons = late_buttons
+                            first_pi = late_pi
+                            first_total_items = extract_total_items(late_state.get("text"))
+                            first_is_pagelike = late_is_pagelike
+                            if first_pi and first_pi.get("current_page"):
+                                try:
+                                    visited_pages.add(int(first_pi.get("current_page")))
+                                except Exception:
+                                    pass
+                            timeline.append({
+                                "step": 0,
+                                "status": "late_state_detected_after_file_observe",
+                                "message_id": late_state.get("message_id"),
+                                "chat_id": late_state.get("chat_id"),
+                                "has_buttons": bool(late_buttons),
+                                "is_pagination_like": bool(late_is_pagelike),
+                                "page_info": late_pi,
+                                "total_items": first_total_items,
+                                "buttons_text": summarize_buttons(late_buttons),
+                                "text_preview": (late_state.get("text") or "")[:200]
+                            })
+                            loop_result = await _continue_pagination_from_current_state(
+                                bot_username=payload.bot_username,
+                                next_keywords=payload.next_text_keywords,
+                                max_steps=int(payload.max_steps or 0),
+                                wait_each_page_timeout_seconds=int(payload.wait_each_page_timeout_seconds),
+                                max_logs=int(payload.debug_max_logs or 0),
+                                max_return_files=int(payload.max_return_files or 0),
+                                max_raw_payload_bytes=int(payload.max_raw_payload_bytes or 0),
+                                stop_when_no_new_files_rounds=int(payload.stop_when_no_new_files_rounds or 0),
+                                stop_when_reached_total_items=bool(payload.stop_when_reached_total_items),
+                                stop_need_confirm_pagination_done=bool(payload.stop_need_confirm_pagination_done),
+                                stop_need_last_page_or_all_pages=bool(payload.stop_need_last_page_or_all_pages),
+                                callback_message_max_age_seconds=int(payload.callback_message_max_age_seconds or 0),
+                                callback_candidate_scan_limit=int(payload.callback_candidate_scan_limit or 0),
+                                observe_when_no_controls_poll_seconds=float(payload.observe_when_no_controls_poll_seconds or 0.5),
+                                min_message_id=int(cleanup_min_mid or 0),
+                                timeline=timeline,
+                                visited_pages=visited_pages,
+                                initial_assumed_total_items=seed_total_items,
+                            )
+                            if loop_result["status"] == "ok":
+                                return await _return_ok(loop_result["reason"])
+                            return await _return_fail(loop_result["reason"], loop_result.get("error"))
                 if first_total_items is not None:
                     try:
                         if int(first_total_items) > 0 and files_unique_count_observed >= int(first_total_items):
