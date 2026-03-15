@@ -1541,6 +1541,13 @@ def _pagination_state_from_message(msg: Optional[Dict[str, Any]], next_keywords:
     has_next = False
     if buttons:
         has_next = _has_next_by_buttons(buttons, effective_next_keywords)
+    elif pi and pi.get("current_page") is not None and pi.get("total_pages") is not None:
+        try:
+            cur = int(pi.get("current_page") or 0)
+            total = int(pi.get("total_pages") or 0)
+            has_next = total > 0 and cur < total
+        except Exception:
+            has_next = False
 
     is_pagination_like = False
     if buttons:
