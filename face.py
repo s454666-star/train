@@ -20,6 +20,7 @@ import re
 import traceback
 import shutil
 import json
+import hashlib
 import mysql.connector
 import sys
 import logging
@@ -388,6 +389,378 @@ class FaceExtractorApp:
         output_base_name = os.path.basename(os.path.abspath(output_dir))
         original_ext = os.path.splitext(original_video_path)[1].lower() or ".mp4"
         return self.sanitize_filename(f"{output_base_name}{original_ext}")
+
+    def build_db_relative_path(self, output_dir: str, filename: str) -> str:
+        folder_name = self.sanitize_filename(os.path.basename(os.path.abspath(output_dir)))
+        safe_filename = self.sanitize_filename(os.path.basename(filename))
+        return f"\\{folder_name}\\{safe_filename}"
+
+    def build_feature_capture_plan(self, duration: float) -> List[Dict[str, Any]]:
+        duration = max(float(duration or 0.0), 0.0)
+
+        if duration < 10.0:
+            capture_second = min(3.0, max(duration - 0.25, 0.0))
+            return [{
+                "capture_order": 1,
+                "label_second": 3.0,
+                "capture_second": round(capture_second, 3),
+            }]
+
+        plan: List[Dict[str, float]] = []
+        for index, target in enumerate([10.0, 20.0, 30.0, 40.0], start=1):
+            if duration + 0.001 < target:
+                continue
+            plan.append({
+                "capture_order": index,
+                "label_second": target,
+                "capture_second": round(min(target, max(duration - 0.25, 0.0)), 3),
+            })
+        return plan
+
+    def build_feature_filename(self, clean_folder_name: str, capture_order: int, label_second: float) -> str:
+        label = f"{label_second:.3f}".rstrip("0").rstrip(".").replace(".", "_")
+        return self.sanitize_filename(f"{clean_folder_name}_feature_{capture_order:02d}_{label}s.jpg")
+
+    def compute_dhash_hex(self, image_path: str) -> str:
+        with Image.open(image_path) as img:
+            gray = img.convert("L").resize((9, 8), Image.LANCZOS)
+            pixels = list(gray.getdata())
+
+        bits: List[int] = []
+        for y in range(8):
+            row = pixels[y * 9:(y + 1) * 9]
+            for x in range(8):
+                bits.append(1 if row[x] > row[x + 1] else 0)
+
+        hex_chunks: List[str] = []
+        for i in range(0, 64, 8):
+            byte = 0
+            for bit in bits[i:i + 8]:
+                byte = (byte << 1) | bit
+            hex_chunks.append(f"{byte:02x}")
+
+        return "".join(hex_chunks)
+
+    def find_master_face_id(self, video_master_id: int) -> Optional[int]:
+        if not self.db_cursor or not video_master_id:
+            return None
+
+        sql = """
+            SELECT vfs.id
+            FROM video_face_screenshots vfs
+            INNER JOIN video_screenshots vs ON vs.id = vfs.video_screenshot_id
+            WHERE vs.video_master_id = %s
+              AND vfs.is_master = 1
+            LIMIT 1
+        """
+        self.db_cursor.execute(sql, (video_master_id,))
+        row = self.db_cursor.fetchone()
+        if not row:
+            return None
+        return int(row[0])
+
+    def clear_existing_video_features(self, video_master_id: int) -> None:
+        if not self.db_cursor or not video_master_id:
+            return
+
+        select_sql = """
+            SELECT vff.video_screenshot_id, vff.screenshot_path
+            FROM video_feature_frames vff
+            INNER JOIN video_features vf ON vf.id = vff.video_feature_id
+            WHERE vf.video_master_id = %s
+        """
+        self.db_cursor.execute(select_sql, (video_master_id,))
+        rows = self.db_cursor.fetchall() or []
+
+        for screenshot_id, screenshot_path in rows:
+            if screenshot_path:
+                screenshot_abs_path = os.path.abspath(os.path.join(r"D:\video", str(screenshot_path).lstrip("\\/").replace("\\", os.sep)))
+                if os.path.exists(screenshot_abs_path):
+                    try:
+                        os.remove(screenshot_abs_path)
+                    except Exception:
+                        pass
+
+            if screenshot_id:
+                self.db_cursor.execute("DELETE FROM video_screenshots WHERE id = %s", (int(screenshot_id),))
+
+        self.db_cursor.execute("DELETE FROM video_features WHERE video_master_id = %s", (video_master_id,))
+
+    def update_video_feature_error(self, video_master_id: int, video_name: str, relative_video_path: str, duration: float, message: str) -> None:
+        if not self.db_cursor or not video_master_id:
+            return
+
+        directory_path = os.path.dirname(relative_video_path.lstrip("\\/")).replace("/", "\\").strip("\\")
+        file_name = os.path.basename(relative_video_path.replace("\\", os.sep))
+        path_sha1 = hashlib.sha1(relative_video_path.lower().encode("utf-8")).hexdigest()
+
+        sql = """
+            INSERT INTO video_features
+            (
+                video_master_id,
+                master_face_screenshot_id,
+                video_name,
+                video_path,
+                directory_path,
+                file_name,
+                path_sha1,
+                file_size_bytes,
+                duration_seconds,
+                file_created_at,
+                file_modified_at,
+                screenshot_count,
+                feature_version,
+                capture_rule,
+                extracted_at,
+                last_error,
+                created_at,
+                updated_at
+            )
+            VALUES
+            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, NOW(), NOW())
+            ON DUPLICATE KEY UPDATE
+                master_face_screenshot_id = VALUES(master_face_screenshot_id),
+                video_name = VALUES(video_name),
+                video_path = VALUES(video_path),
+                directory_path = VALUES(directory_path),
+                file_name = VALUES(file_name),
+                path_sha1 = VALUES(path_sha1),
+                duration_seconds = VALUES(duration_seconds),
+                capture_rule = VALUES(capture_rule),
+                feature_version = VALUES(feature_version),
+                extracted_at = NOW(),
+                last_error = VALUES(last_error),
+                updated_at = NOW()
+        """
+
+        self.db_cursor.execute(
+            sql,
+            (
+                video_master_id,
+                self.find_master_face_id(video_master_id),
+                video_name,
+                relative_video_path,
+                directory_path or None,
+                file_name,
+                path_sha1,
+                None,
+                round(float(duration or 0.0), 3),
+                None,
+                None,
+                0,
+                "v1",
+                "10s_x4",
+                message[:65535],
+            ),
+        )
+        self.db_connection.commit()
+
+    def create_video_feature_records(
+        self,
+        video_master_id: Optional[int],
+        output_dir: str,
+        destination_path: str,
+        clean_folder_name: str,
+        duration: float,
+    ) -> None:
+        if not self.db_cursor or not self.db_connection or not video_master_id:
+            return
+
+        relative_video_path = self.build_db_relative_path(output_dir, os.path.basename(destination_path))
+        video_name = os.path.basename(destination_path)
+
+        capture_plan = self.build_feature_capture_plan(duration)
+        if not capture_plan:
+            self.update_video_feature_error(video_master_id, video_name, relative_video_path, duration, "無法建立影片特徵截圖計畫")
+            return
+
+        cap = cv2.VideoCapture(destination_path)
+        if not cap.isOpened():
+            self.update_video_feature_error(video_master_id, video_name, relative_video_path, duration, "無法打開影片檔案進行特徵擷取")
+            return
+
+        try:
+            self.clear_existing_video_features(video_master_id)
+
+            directory_path = os.path.dirname(relative_video_path.lstrip("\\/")).replace("/", "\\").strip("\\")
+            file_name = os.path.basename(destination_path)
+            path_sha1 = hashlib.sha1(relative_video_path.lower().encode("utf-8")).hexdigest()
+            file_size_bytes = os.path.getsize(destination_path) if os.path.exists(destination_path) else None
+            file_created_at = datetime.fromtimestamp(os.path.getctime(destination_path)) if os.path.exists(destination_path) else None
+            file_modified_at = datetime.fromtimestamp(os.path.getmtime(destination_path)) if os.path.exists(destination_path) else None
+            capture_rule = "lt_10s_at_3s" if float(duration or 0.0) < 10.0 else "10s_x4"
+
+            feature_sql = """
+                INSERT INTO video_features
+                (
+                    video_master_id,
+                    master_face_screenshot_id,
+                    video_name,
+                    video_path,
+                    directory_path,
+                    file_name,
+                    path_sha1,
+                    file_size_bytes,
+                    duration_seconds,
+                    file_created_at,
+                    file_modified_at,
+                    screenshot_count,
+                    feature_version,
+                    capture_rule,
+                    extracted_at,
+                    last_error,
+                    created_at,
+                    updated_at
+                )
+                VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NULL, NOW(), NOW())
+                ON DUPLICATE KEY UPDATE
+                    master_face_screenshot_id = VALUES(master_face_screenshot_id),
+                    video_name = VALUES(video_name),
+                    video_path = VALUES(video_path),
+                    directory_path = VALUES(directory_path),
+                    file_name = VALUES(file_name),
+                    path_sha1 = VALUES(path_sha1),
+                    file_size_bytes = VALUES(file_size_bytes),
+                    duration_seconds = VALUES(duration_seconds),
+                    file_created_at = VALUES(file_created_at),
+                    file_modified_at = VALUES(file_modified_at),
+                    screenshot_count = VALUES(screenshot_count),
+                    feature_version = VALUES(feature_version),
+                    capture_rule = VALUES(capture_rule),
+                    extracted_at = NOW(),
+                    last_error = NULL,
+                    updated_at = NOW()
+            """
+
+            self.db_cursor.execute(
+                feature_sql,
+                (
+                    video_master_id,
+                    self.find_master_face_id(video_master_id),
+                    video_name,
+                    relative_video_path,
+                    directory_path or None,
+                    file_name,
+                    path_sha1,
+                    file_size_bytes,
+                    round(float(duration or 0.0), 3),
+                    file_created_at,
+                    file_modified_at,
+                    len(capture_plan),
+                    "v1",
+                    capture_rule,
+                ),
+            )
+
+            self.db_cursor.execute("SELECT id FROM video_features WHERE video_master_id = %s", (video_master_id,))
+            feature_row = self.db_cursor.fetchone()
+            if not feature_row:
+                raise RuntimeError(f"找不到 video_features：video_master_id={video_master_id}")
+            video_feature_id = int(feature_row[0])
+
+            inserted_count = 0
+
+            for plan in capture_plan:
+                capture_order = int(plan["capture_order"])
+                label_second = float(plan["label_second"])
+                capture_second = float(plan["capture_second"])
+
+                cap.set(cv2.CAP_PROP_POS_MSEC, capture_second * 1000.0)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    print(f"無法擷取特徵截圖：{destination_path} @ {capture_second}s")
+                    continue
+
+                feature_filename = self.build_feature_filename(clean_folder_name, capture_order, label_second)
+                feature_path = os.path.abspath(os.path.join(output_dir, feature_filename))
+                self.ensure_dir(os.path.dirname(feature_path))
+
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(rgb_frame)
+                pil_image.save(feature_path)
+
+                screenshot_db_path = self.build_db_relative_path(output_dir, os.path.basename(feature_path))
+
+                self.db_cursor.execute(
+                    """
+                        INSERT INTO video_screenshots (video_master_id, screenshot_path)
+                        VALUES (%s, %s)
+                    """,
+                    (video_master_id, screenshot_db_path),
+                )
+                screenshot_id = int(self.db_cursor.lastrowid)
+
+                dhash_hex = self.compute_dhash_hex(feature_path)
+                image_width, image_height = pil_image.size
+                frame_sha1 = hashlib.sha1()
+                with open(feature_path, "rb") as image_fp:
+                    frame_sha1.update(image_fp.read())
+
+                self.db_cursor.execute(
+                    """
+                        INSERT INTO video_feature_frames
+                        (
+                            video_feature_id,
+                            video_screenshot_id,
+                            capture_order,
+                            capture_second,
+                            screenshot_path,
+                            dhash_hex,
+                            dhash_prefix,
+                            frame_sha1,
+                            image_width,
+                            image_height,
+                            created_at,
+                            updated_at
+                        )
+                        VALUES
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    """,
+                    (
+                        video_feature_id,
+                        screenshot_id,
+                        capture_order,
+                        round(capture_second, 3),
+                        screenshot_db_path,
+                        dhash_hex,
+                        dhash_hex[:2],
+                        frame_sha1.hexdigest(),
+                        image_width,
+                        image_height,
+                    ),
+                )
+
+                inserted_count += 1
+
+            self.db_cursor.execute(
+                """
+                    UPDATE video_features
+                    SET screenshot_count = %s,
+                        master_face_screenshot_id = %s,
+                        last_error = NULL,
+                        extracted_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                """,
+                (
+                    inserted_count,
+                    self.find_master_face_id(video_master_id),
+                    video_feature_id,
+                ),
+            )
+
+            self.db_connection.commit()
+            print(f"已建立影片特徵資料，video_master_id={video_master_id}, feature_frames={inserted_count}")
+        except Exception as err:
+            self.db_connection.rollback()
+            try:
+                self.update_video_feature_error(video_master_id, video_name, relative_video_path, duration, str(err))
+            except Exception:
+                pass
+            raise
+        finally:
+            cap.release()
 
     def eagle_api_request(self, method: str, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"http://localhost:41595{endpoint}"
@@ -843,6 +1216,23 @@ class FaceExtractorApp:
 
                     shutil.move(video_path, destination_path)
                     print(f"已移動影片檔案至: {destination_path}")
+
+                    try:
+                        self.create_video_feature_records(
+                            video_master_id=video_master_id,
+                            output_dir=output_dir,
+                            destination_path=destination_path,
+                            clean_folder_name=clean_folder_name,
+                            duration=duration,
+                        )
+                    except Exception as feature_err:
+                        try:
+                            LOGGER.exception("建立影片特徵資料失敗: %s", feature_err)
+                            _flush_logs()
+                        except Exception:
+                            pass
+                        print(f"建立影片特徵資料時發生錯誤: {feature_err}")
+                        traceback.print_exc()
 
                     retry_dir = os.path.abspath(r"Z:\video(重跑)")
                     self.ensure_dir(retry_dir)
