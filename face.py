@@ -23,6 +23,7 @@ import json
 import hashlib
 import mysql.connector
 import sys
+import subprocess
 import logging
 import faulthandler
 import atexit
@@ -417,29 +418,102 @@ class FaceExtractorApp:
             })
         return plan
 
-    def build_feature_filename(self, clean_folder_name: str, capture_order: int, label_second: float) -> str:
+    def build_feature_filename(self, video_path: str, capture_order: int, label_second: float) -> str:
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        base_name = re.sub(r'[<>:"/\\|?*]+', '_', base_name) or "video"
         label = f"{label_second:.3f}".rstrip("0").rstrip(".").replace(".", "_")
-        return self.sanitize_filename(f"{clean_folder_name}_feature_{capture_order:02d}_{label}s.jpg")
+        return f"{base_name}_feature_{capture_order:02d}_{label}s.jpg"
 
     def compute_dhash_hex(self, image_path: str) -> str:
         with Image.open(image_path) as img:
-            gray = img.convert("L").resize((9, 8), Image.LANCZOS)
-            pixels = list(gray.getdata())
+            resized = img.convert("RGB").resize((9, 8), Image.BILINEAR)
+            pixels = list(resized.getdata())
 
-        bits: List[int] = []
+        bytes_out = [0] * 8
+        bit_index = 0
+
         for y in range(8):
-            row = pixels[y * 9:(y + 1) * 9]
             for x in range(8):
-                bits.append(1 if row[x] > row[x + 1] else 0)
+                left = pixels[(y * 9) + x]
+                right = pixels[(y * 9) + x + 1]
 
-        hex_chunks: List[str] = []
-        for i in range(0, 64, 8):
-            byte = 0
-            for bit in bits[i:i + 8]:
-                byte = (byte << 1) | bit
-            hex_chunks.append(f"{byte:02x}")
+                left_gray = (int(left[0]) + int(left[1]) + int(left[2])) // 3
+                right_gray = (int(right[0]) + int(right[1]) + int(right[2])) // 3
+                bit = 1 if left_gray > right_gray else 0
 
-        return "".join(hex_chunks)
+                byte_pos = bit_index // 8
+                bit_pos = 7 - (bit_index % 8)
+                if bit == 1:
+                    bytes_out[byte_pos] |= 1 << bit_pos
+
+                bit_index += 1
+
+        return "".join(f"{byte & 255:02x}" for byte in bytes_out)
+
+    def probe_video_duration(self, video_path: str) -> float:
+        ffprobe_bin = os.environ.get("FFPROBE_BIN", "ffprobe")
+        command = [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            video_path,
+        ]
+
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        except FileNotFoundError as err:
+            raise RuntimeError(f"ffprobe 不存在：{ffprobe_bin}") from err
+        except subprocess.TimeoutExpired as err:
+            raise RuntimeError(f"ffprobe 執行逾時：{video_path}") from err
+
+        if result.returncode != 0:
+            output = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"ffprobe 失敗：{output}")
+
+        output = (result.stdout or "").strip()
+        if not output:
+            raise RuntimeError("ffprobe 未回傳有效的 duration")
+
+        try:
+            duration = float(output)
+        except ValueError as err:
+            raise RuntimeError("ffprobe 未回傳有效的 duration") from err
+
+        return max(duration, 0.0)
+
+    def capture_feature_frame(self, video_path: str, capture_second: float, output_path: str) -> None:
+        ffmpeg_bin = os.environ.get("FFMPEG_BIN", "ffmpeg")
+        command = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{capture_second:.3f}",
+            "-i",
+            video_path,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            output_path,
+        ]
+
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+        except FileNotFoundError as err:
+            raise RuntimeError(f"ffmpeg 不存在：{ffmpeg_bin}") from err
+        except subprocess.TimeoutExpired as err:
+            raise RuntimeError(f"ffmpeg 擷取截圖逾時：{video_path}") from err
+
+        if result.returncode != 0 or not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
+            output = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"ffmpeg 擷取截圖失敗：{output}")
 
     def find_master_face_id(self, video_master_id: int) -> Optional[int]:
         if not self.db_cursor or not video_master_id:
@@ -568,18 +642,18 @@ class FaceExtractorApp:
 
         relative_video_path = self.build_db_relative_path(output_dir, os.path.basename(destination_path))
         video_name = os.path.basename(destination_path)
-
-        capture_plan = self.build_feature_capture_plan(duration)
-        if not capture_plan:
-            self.update_video_feature_error(video_master_id, video_name, relative_video_path, duration, "無法建立影片特徵截圖計畫")
-            return
-
-        cap = cv2.VideoCapture(destination_path)
-        if not cap.isOpened():
-            self.update_video_feature_error(video_master_id, video_name, relative_video_path, duration, "無法打開影片檔案進行特徵擷取")
-            return
+        feature_duration = round(float(duration or 0.0), 3)
+        created_files: List[str] = []
 
         try:
+            feature_duration = round(self.probe_video_duration(destination_path), 3)
+            if feature_duration <= 0:
+                raise RuntimeError(f"ffprobe 無法取得影片時長：{destination_path}")
+
+            capture_plan = self.build_feature_capture_plan(feature_duration)
+            if not capture_plan:
+                raise RuntimeError("無法建立影片特徵截圖計畫")
+
             self.clear_existing_video_features(video_master_id)
 
             directory_path = os.path.dirname(relative_video_path.lstrip("\\/")).replace("/", "\\").strip("\\")
@@ -588,7 +662,7 @@ class FaceExtractorApp:
             file_size_bytes = os.path.getsize(destination_path) if os.path.exists(destination_path) else None
             file_created_at = datetime.fromtimestamp(os.path.getctime(destination_path)) if os.path.exists(destination_path) else None
             file_modified_at = datetime.fromtimestamp(os.path.getmtime(destination_path)) if os.path.exists(destination_path) else None
-            capture_rule = "lt_10s_at_3s" if float(duration or 0.0) < 10.0 else "10s_x4"
+            capture_rule = "lt_10s_at_3s" if feature_duration < 10.0 else "10s_x4"
 
             feature_sql = """
                 INSERT INTO video_features
@@ -644,7 +718,7 @@ class FaceExtractorApp:
                     file_name,
                     path_sha1,
                     file_size_bytes,
-                    round(float(duration or 0.0), 3),
+                    feature_duration,
                     file_created_at,
                     file_modified_at,
                     len(capture_plan),
@@ -666,19 +740,11 @@ class FaceExtractorApp:
                 label_second = float(plan["label_second"])
                 capture_second = float(plan["capture_second"])
 
-                cap.set(cv2.CAP_PROP_POS_MSEC, capture_second * 1000.0)
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    print(f"無法擷取特徵截圖：{destination_path} @ {capture_second}s")
-                    continue
-
-                feature_filename = self.build_feature_filename(clean_folder_name, capture_order, label_second)
+                feature_filename = self.build_feature_filename(destination_path, capture_order, label_second)
                 feature_path = os.path.abspath(os.path.join(output_dir, feature_filename))
                 self.ensure_dir(os.path.dirname(feature_path))
-
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_image = Image.fromarray(rgb_frame)
-                pil_image.save(feature_path)
+                self.capture_feature_frame(destination_path, capture_second, feature_path)
+                created_files.append(feature_path)
 
                 screenshot_db_path = self.build_db_relative_path(output_dir, os.path.basename(feature_path))
 
@@ -692,7 +758,8 @@ class FaceExtractorApp:
                 screenshot_id = int(self.db_cursor.lastrowid)
 
                 dhash_hex = self.compute_dhash_hex(feature_path)
-                image_width, image_height = pil_image.size
+                with Image.open(feature_path) as feature_image:
+                    image_width, image_height = feature_image.size
                 frame_sha1 = hashlib.sha1()
                 with open(feature_path, "rb") as image_fp:
                     frame_sha1.update(image_fp.read())
@@ -733,6 +800,9 @@ class FaceExtractorApp:
 
                 inserted_count += 1
 
+            if inserted_count <= 0:
+                raise RuntimeError("無法建立任何影片特徵截圖")
+
             self.db_cursor.execute(
                 """
                     UPDATE video_features
@@ -754,13 +824,17 @@ class FaceExtractorApp:
             print(f"已建立影片特徵資料，video_master_id={video_master_id}, feature_frames={inserted_count}")
         except Exception as err:
             self.db_connection.rollback()
+            for created_file in created_files:
+                try:
+                    if created_file and os.path.exists(created_file):
+                        os.remove(created_file)
+                except Exception:
+                    pass
             try:
-                self.update_video_feature_error(video_master_id, video_name, relative_video_path, duration, str(err))
+                self.update_video_feature_error(video_master_id, video_name, relative_video_path, feature_duration, str(err))
             except Exception:
                 pass
             raise
-        finally:
-            cap.release()
 
     def eagle_api_request(self, method: str, endpoint: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"http://localhost:41595{endpoint}"
@@ -1065,7 +1139,12 @@ class FaceExtractorApp:
             try:
                 fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-                duration = (total_frames / fps) if (fps > 0 and total_frames > 0) else 0.0
+                fallback_duration = (total_frames / fps) if (fps > 0 and total_frames > 0) else 0.0
+                try:
+                    duration = self.probe_video_duration(video_path)
+                except Exception as duration_err:
+                    duration = fallback_duration
+                    print(f"ffprobe 取得時長失敗，改用 OpenCV 推估: {duration_err}")
 
                 frame_count = self.frame_count
                 frame_indices = self._compute_frame_indices(total_frames, frame_count)
@@ -1085,7 +1164,7 @@ class FaceExtractorApp:
                             VALUES (%s, %s, %s, %s)
                         """
                         relative_video_path = f"\\{os.path.basename(output_dir)}\\{output_video_name}"
-                        self.db_cursor.execute(insert_video, (output_video_name, relative_video_path, round(duration, 2), video_type))
+                        self.db_cursor.execute(insert_video, (output_video_name, relative_video_path, round(duration, 3), video_type))
                         self.db_connection.commit()
                         video_master_id = self.db_cursor.lastrowid
                         print(f"已插入 video_master, ID: {video_master_id}")
