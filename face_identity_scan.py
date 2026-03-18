@@ -72,10 +72,19 @@ class CandidateCluster:
 
 
 class FaceIdentityScanner:
-    def __init__(self, force: bool = False, limit: Optional[int] = None, paths: Optional[list[str]] = None) -> None:
+    def __init__(
+        self,
+        force: bool = False,
+        limit: Optional[int] = None,
+        paths: Optional[list[str]] = None,
+        regroup_after_scan: bool = False,
+        regroup_only: bool = False,
+    ) -> None:
         self.force = force
         self.limit = limit
         self.override_paths = paths or []
+        self.regroup_after_scan = regroup_after_scan or regroup_only
+        self.regroup_only = regroup_only
         self.logger = self._configure_logger()
         self.device = torch.device("cpu")
         self.mtcnn = MTCNN(
@@ -91,10 +100,20 @@ class FaceIdentityScanner:
 
     def run(self) -> int:
         self._assert_schema()
+
+        if self.regroup_only:
+            self.logger.info("只重建現有分組，不重新抽幀。")
+            self._rebuild_groups()
+            return 0
+
         discovered = self._discover_videos()
 
         if not discovered:
-            self.logger.info("沒有找到任何待掃描影片。")
+            if self.regroup_after_scan:
+                self.logger.info("沒有找到新的待掃描影片，改為重建現有分組。")
+                self._rebuild_groups()
+            else:
+                self.logger.info("沒有找到任何待掃描影片。")
             return 0
 
         total = len(discovered)
@@ -113,6 +132,8 @@ class FaceIdentityScanner:
                     self.logger.exception("寫入錯誤狀態失敗：%s", item.video_path)
 
         self.logger.info("掃描完成，成功處理 %s / %s 部影片。", processed, total)
+        if processed > 0 or self.regroup_after_scan:
+            self._rebuild_groups()
         return 0
 
     def close(self) -> None:
@@ -613,8 +634,14 @@ class FaceIdentityScanner:
                 person_id = old_person_id
                 assignment_source = "manual"
             elif selected_samples:
-                centroid = normalize_vector(np.mean([sample.embedding for sample in selected_samples], axis=0))
-                person_id, match_confidence, is_new_person = self._match_or_create_person(cursor, centroid)
+                candidate_embeddings = [sample.embedding for sample in selected_samples]
+                centroid = normalize_vector(np.mean(candidate_embeddings, axis=0))
+                person_id, match_confidence, is_new_person = self._match_or_create_person(
+                    cursor,
+                    centroid,
+                    candidate_embeddings,
+                    exclude_video_id=int(existing["id"]) if existing else None,
+                )
                 assignment_source = "auto_new" if is_new_person else "auto"
 
             relative_path = normalize_relative_path(item.root_path, absolute_path)
@@ -805,6 +832,8 @@ class FaceIdentityScanner:
         self,
         cursor: mysql.connector.cursor.MySQLCursorDict,
         centroid_embedding: np.ndarray,
+        candidate_embeddings: list[np.ndarray],
+        exclude_video_id: Optional[int] = None,
     ) -> tuple[int, Optional[float], bool]:
         cursor.execute(
             """
@@ -813,25 +842,80 @@ class FaceIdentityScanner:
             WHERE feature_model = %s
               AND centroid_embedding_json IS NOT NULL
               AND video_count > 0
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM face_identity_videos locked_videos
+                  WHERE locked_videos.person_id = face_identity_people.id
+                    AND locked_videos.group_locked = 1
+              )
             ORDER BY id
             """,
             (config.FEATURE_MODEL,),
         )
 
-        best_person_id: Optional[int] = None
-        best_similarity = -1.0
+        best_match: Optional[dict[str, Any]] = None
 
         for row in cursor.fetchall():
             existing_vector = json_to_vector(row["centroid_embedding_json"])
             if existing_vector is None:
                 continue
-            similarity = cosine_similarity(centroid_embedding, existing_vector)
-            if similarity > best_similarity:
-                best_similarity = similarity
-                best_person_id = int(row["id"])
+            person_centroid_similarity = cosine_similarity(centroid_embedding, existing_vector)
+            if person_centroid_similarity < config.PERSON_MATCH_THRESHOLD:
+                continue
 
-        if best_person_id is not None and best_similarity >= config.PERSON_MATCH_THRESHOLD:
-            return best_person_id, round(best_similarity, 4), False
+            person_video_bank = self._load_person_video_bank(
+                cursor,
+                int(row["id"]),
+                exclude_video_id=exclude_video_id,
+            )
+            if not person_video_bank:
+                continue
+
+            link_scores = []
+            for video_bank_item in person_video_bank:
+                link_score = self._score_person_video_link(
+                    candidate_embeddings,
+                    centroid_embedding,
+                    video_bank_item["embeddings"],
+                    video_bank_item["centroid"],
+                )
+                if link_score is not None:
+                    link_scores.append(link_score)
+
+            required_links = self._required_person_links(len(person_video_bank))
+            if len(link_scores) < required_links:
+                continue
+
+            link_scores.sort(
+                key=lambda item: (
+                    float(item["top_average_similarity"]),
+                    int(item["matched_sample_count"]),
+                    float(item["centroid_similarity"]),
+                    float(item["max_similarity"]),
+                ),
+                reverse=True,
+            )
+            selected_links = link_scores[:required_links]
+            link_average = sum(float(item["top_average_similarity"]) for item in selected_links) / required_links
+            matched_sample_sum = sum(int(item["matched_sample_count"]) for item in selected_links)
+            video_centroid_average = sum(float(item["centroid_similarity"]) for item in selected_links) / required_links
+            cluster_score = (
+                link_average,
+                matched_sample_sum,
+                video_centroid_average,
+                len(link_scores),
+                person_centroid_similarity,
+            )
+
+            if best_match is None or cluster_score > best_match["score"]:
+                best_match = {
+                    "person_id": int(row["id"]),
+                    "confidence": link_average,
+                    "score": cluster_score,
+                }
+
+        if best_match is not None:
+            return best_match["person_id"], round(float(best_match["confidence"]), 4), False
 
         cursor.execute(
             """
@@ -841,6 +925,490 @@ class FaceIdentityScanner:
             (config.FEATURE_MODEL,),
         )
         return int(cursor.lastrowid), None, True
+
+    def _rebuild_groups(self) -> None:
+        cursor = self.connection.cursor(dictionary=True)
+
+        try:
+            self.connection.start_transaction()
+            cursor.execute(
+                """
+                SELECT DISTINCT person_id
+                FROM face_identity_videos
+                WHERE group_locked = 1
+                  AND person_id IS NOT NULL
+                """
+            )
+            preserved_person_ids = {
+                int(row["person_id"])
+                for row in cursor.fetchall()
+                if row.get("person_id") is not None
+            }
+
+            cursor.execute(
+                """
+                UPDATE face_identity_samples samples
+                INNER JOIN face_identity_videos videos ON videos.id = samples.video_id
+                SET samples.person_id = NULL,
+                    samples.updated_at = NOW()
+                WHERE videos.group_locked = 0
+                """
+            )
+            cursor.execute(
+                """
+                UPDATE face_identity_videos
+                SET person_id = NULL,
+                    match_confidence = NULL,
+                    assignment_source = CASE
+                        WHEN accepted_sample_count > 0 AND scan_status = 'complete' THEN 'auto'
+                        ELSE assignment_source
+                    END,
+                    updated_at = NOW()
+                WHERE group_locked = 0
+                """
+            )
+
+            if preserved_person_ids:
+                placeholders = ", ".join(["%s"] * len(preserved_person_ids))
+                cursor.execute(
+                    f"DELETE FROM face_identity_people WHERE id NOT IN ({placeholders})",
+                    tuple(sorted(preserved_person_ids)),
+                )
+            else:
+                cursor.execute("DELETE FROM face_identity_people")
+
+            for person_id in sorted(preserved_person_ids):
+                self._refresh_person_summary(cursor, person_id)
+
+            video_payloads = self._load_regroup_video_payloads(cursor)
+            edge_scores = self._build_video_link_scores(video_payloads)
+            clusters = self._cluster_videos_by_links(video_payloads, edge_scores)
+            regrouped_count = self._persist_regrouped_clusters(cursor, clusters, edge_scores)
+
+            self.connection.commit()
+            self.logger.info("重建分組完成：已重新指派 %s 部未鎖定作品。", regrouped_count)
+        except Exception:  # noqa: BLE001
+            self.connection.rollback()
+            raise
+        finally:
+            cursor.close()
+
+    def _load_video_embeddings(
+        self,
+        cursor: mysql.connector.cursor.MySQLCursorDict,
+        video_id: int,
+    ) -> tuple[list[np.ndarray], Optional[np.ndarray]]:
+        cursor.execute(
+            """
+            SELECT embedding_json
+            FROM face_identity_samples
+            WHERE video_id = %s
+            ORDER BY capture_order
+            """,
+            (video_id,),
+        )
+
+        embeddings = [
+            vector
+            for vector in (json_to_vector(row["embedding_json"]) for row in cursor.fetchall())
+            if vector is not None
+        ]
+        if not embeddings:
+            return [], None
+
+        centroid = normalize_vector(np.mean(np.stack(embeddings, axis=0), axis=0))
+        return embeddings, centroid
+
+    def _load_regroup_video_payloads(
+        self,
+        cursor: mysql.connector.cursor.MySQLCursorDict,
+    ) -> list[dict[str, Any]]:
+        cursor.execute(
+            """
+            SELECT id, feature_model, preview_sample_path
+            FROM face_identity_videos
+            WHERE group_locked = 0
+              AND scan_status = 'complete'
+              AND accepted_sample_count > 0
+            ORDER BY id
+            """
+        )
+
+        payloads = []
+        for row in cursor.fetchall():
+            video_id = int(row["id"])
+            embeddings, centroid = self._load_video_embeddings(cursor, video_id)
+            if not embeddings or centroid is None:
+                continue
+
+            payloads.append(
+                {
+                    "id": video_id,
+                    "feature_model": str(row.get("feature_model") or config.FEATURE_MODEL),
+                    "preview_sample_path": row.get("preview_sample_path"),
+                    "embeddings": embeddings,
+                    "centroid": centroid,
+                }
+            )
+
+        return payloads
+
+    def _build_video_link_scores(
+        self,
+        video_payloads: list[dict[str, Any]],
+    ) -> dict[tuple[int, int], dict[str, float]]:
+        edge_scores: dict[tuple[int, int], dict[str, float]] = {}
+
+        for index, left_payload in enumerate(video_payloads):
+            for right_payload in video_payloads[index + 1 :]:
+                link_score = self._score_person_video_link(
+                    left_payload["embeddings"],
+                    left_payload["centroid"],
+                    right_payload["embeddings"],
+                    right_payload["centroid"],
+                )
+                if link_score is None:
+                    continue
+
+                edge_scores[self._video_edge_key(int(left_payload["id"]), int(right_payload["id"]))] = link_score
+
+        return edge_scores
+
+    def _cluster_videos_by_links(
+        self,
+        video_payloads: list[dict[str, Any]],
+        edge_scores: dict[tuple[int, int], dict[str, float]],
+    ) -> list[list[dict[str, Any]]]:
+        payload_by_id = {
+            int(payload["id"]): payload
+            for payload in video_payloads
+        }
+        unassigned_video_ids = set(payload_by_id.keys())
+        clusters: list[list[int]] = []
+
+        while unassigned_video_ids:
+            seed_pair = self._best_unassigned_seed_pair(unassigned_video_ids, edge_scores)
+            if seed_pair is None:
+                solo_video_id = min(unassigned_video_ids)
+                clusters.append([solo_video_id])
+                unassigned_video_ids.remove(solo_video_id)
+                continue
+
+            cluster_video_ids = [seed_pair[0], seed_pair[1]]
+            unassigned_video_ids.remove(seed_pair[0])
+            unassigned_video_ids.remove(seed_pair[1])
+
+            while True:
+                next_video_id = self._best_cluster_candidate(
+                    cluster_video_ids,
+                    unassigned_video_ids,
+                    edge_scores,
+                )
+                if next_video_id is None:
+                    break
+
+                cluster_video_ids.append(next_video_id)
+                unassigned_video_ids.remove(next_video_id)
+
+            clusters.append(sorted(cluster_video_ids))
+
+        clusters.sort(key=lambda cluster_video_ids: (-len(cluster_video_ids), cluster_video_ids[0]))
+        return [
+            [payload_by_id[video_id] for video_id in cluster_video_ids]
+            for cluster_video_ids in clusters
+        ]
+
+    def _best_unassigned_seed_pair(
+        self,
+        unassigned_video_ids: set[int],
+        edge_scores: dict[tuple[int, int], dict[str, float]],
+    ) -> Optional[tuple[int, int]]:
+        sorted_video_ids = sorted(unassigned_video_ids)
+        best_pair: Optional[tuple[int, int]] = None
+        best_score: Optional[tuple[float, float, float, float]] = None
+
+        for index, left_video_id in enumerate(sorted_video_ids):
+            for right_video_id in sorted_video_ids[index + 1 :]:
+                edge_score = edge_scores.get(self._video_edge_key(left_video_id, right_video_id))
+                if edge_score is None:
+                    continue
+
+                score = self._edge_sort_key(edge_score)
+                if best_score is None or score > best_score:
+                    best_pair = (left_video_id, right_video_id)
+                    best_score = score
+
+        return best_pair
+
+    def _best_cluster_candidate(
+        self,
+        cluster_video_ids: list[int],
+        unassigned_video_ids: set[int],
+        edge_scores: dict[tuple[int, int], dict[str, float]],
+    ) -> Optional[int]:
+        best_video_id: Optional[int] = None
+        best_score: Optional[tuple[float, float, float, float]] = None
+
+        for candidate_video_id in sorted(unassigned_video_ids):
+            candidate_edges = []
+            for existing_video_id in cluster_video_ids:
+                edge_score = edge_scores.get(self._video_edge_key(candidate_video_id, existing_video_id))
+                if edge_score is None:
+                    candidate_edges = []
+                    break
+                candidate_edges.append(edge_score)
+
+            if not candidate_edges:
+                continue
+
+            score = (
+                sum(float(edge["top_average_similarity"]) for edge in candidate_edges) / len(candidate_edges),
+                float(sum(float(edge["matched_sample_count"]) for edge in candidate_edges)),
+                sum(float(edge["centroid_similarity"]) for edge in candidate_edges) / len(candidate_edges),
+                min(float(edge["top_average_similarity"]) for edge in candidate_edges),
+            )
+            if best_score is None or score > best_score:
+                best_video_id = candidate_video_id
+                best_score = score
+
+        return best_video_id
+
+    def _persist_regrouped_clusters(
+        self,
+        cursor: mysql.connector.cursor.MySQLCursorDict,
+        clusters: list[list[dict[str, Any]]],
+        edge_scores: dict[tuple[int, int], dict[str, float]],
+    ) -> int:
+        regrouped_count = 0
+
+        for cluster in clusters:
+            if not cluster:
+                continue
+
+            seed_payload = cluster[0]
+            cursor.execute(
+                """
+                INSERT INTO face_identity_people (feature_model, cover_sample_path, created_at, updated_at)
+                VALUES (%s, %s, NOW(), NOW())
+                """,
+                (
+                    seed_payload["feature_model"],
+                    seed_payload.get("preview_sample_path"),
+                ),
+            )
+            person_id = int(cursor.lastrowid)
+            assigned_video_ids: list[int] = []
+
+            for payload in cluster:
+                video_id = int(payload["id"])
+                match_confidence = self._cluster_match_confidence(video_id, assigned_video_ids, edge_scores)
+                assignment_source = "auto_new" if not assigned_video_ids else "auto"
+
+                cursor.execute(
+                    """
+                    UPDATE face_identity_videos
+                    SET person_id = %s,
+                        match_confidence = %s,
+                        assignment_source = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (
+                        person_id,
+                        match_confidence,
+                        assignment_source,
+                        video_id,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    UPDATE face_identity_samples
+                    SET person_id = %s,
+                        updated_at = NOW()
+                    WHERE video_id = %s
+                    """,
+                    (
+                        person_id,
+                        video_id,
+                    ),
+                )
+
+                assigned_video_ids.append(video_id)
+                regrouped_count += 1
+
+            self._refresh_person_summary(cursor, person_id)
+
+        return regrouped_count
+
+    def _cluster_match_confidence(
+        self,
+        video_id: int,
+        prior_video_ids: list[int],
+        edge_scores: dict[tuple[int, int], dict[str, float]],
+    ) -> Optional[float]:
+        if not prior_video_ids:
+            return None
+
+        confidence_scores = []
+        for prior_video_id in prior_video_ids:
+            edge_score = edge_scores.get(self._video_edge_key(video_id, prior_video_id))
+            if edge_score is None:
+                continue
+            confidence_scores.append(float(edge_score["top_average_similarity"]))
+
+        if not confidence_scores:
+            return None
+
+        confidence_scores.sort(reverse=True)
+        top_count = min(config.PERSON_MAX_REQUIRED_VIDEO_LINKS, len(confidence_scores))
+        return round(sum(confidence_scores[:top_count]) / top_count, 4)
+
+    def _video_edge_key(self, left_video_id: int, right_video_id: int) -> tuple[int, int]:
+        if left_video_id <= right_video_id:
+            return left_video_id, right_video_id
+        return right_video_id, left_video_id
+
+    def _edge_sort_key(self, edge_score: dict[str, float]) -> tuple[float, float, float, float]:
+        return (
+            float(edge_score["top_average_similarity"]),
+            float(edge_score["matched_sample_count"]),
+            float(edge_score["centroid_similarity"]),
+            float(edge_score["max_similarity"]),
+        )
+
+    def _load_person_video_bank(
+        self,
+        cursor: mysql.connector.cursor.MySQLCursorDict,
+        person_id: int,
+        exclude_video_id: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        query = """
+            SELECT samples.video_id, samples.embedding_json
+            FROM face_identity_samples samples
+            INNER JOIN face_identity_videos videos ON videos.id = samples.video_id
+            WHERE videos.person_id = %s
+              AND videos.group_locked = 0
+        """
+        params: list[Any] = [person_id]
+
+        if exclude_video_id is not None:
+            query += " AND videos.id <> %s"
+            params.append(exclude_video_id)
+
+        query += " ORDER BY samples.video_id, samples.capture_order"
+        cursor.execute(query, tuple(params))
+
+        grouped_embeddings: dict[int, list[np.ndarray]] = {}
+        for row in cursor.fetchall():
+            embedding = json_to_vector(row["embedding_json"])
+            if embedding is None:
+                continue
+            grouped_embeddings.setdefault(int(row["video_id"]), []).append(embedding)
+
+        video_bank = []
+        for video_id, embeddings in grouped_embeddings.items():
+            if not embeddings:
+                continue
+            video_bank.append(
+                {
+                    "video_id": video_id,
+                    "embeddings": embeddings,
+                    "centroid": normalize_vector(np.mean(np.stack(embeddings, axis=0), axis=0)),
+                }
+            )
+
+        return video_bank
+
+    def _score_person_video_link(
+        self,
+        candidate_embeddings: list[np.ndarray],
+        candidate_centroid: np.ndarray,
+        existing_embeddings: list[np.ndarray],
+        existing_centroid: np.ndarray,
+    ) -> Optional[dict[str, float]]:
+        if not candidate_embeddings or not existing_embeddings:
+            return None
+
+        centroid_similarity = cosine_similarity(candidate_centroid, existing_centroid)
+        if centroid_similarity < config.PERSON_VIDEO_CENTROID_MATCH_THRESHOLD:
+            return None
+
+        forward = self._measure_sample_support(candidate_embeddings, existing_embeddings)
+        backward = self._measure_sample_support(existing_embeddings, candidate_embeddings)
+
+        top_average_similarity = min(
+            float(forward["top_average_similarity"]),
+            float(backward["top_average_similarity"]),
+        )
+        matched_sample_count = min(
+            int(forward["matched_sample_count"]),
+            int(backward["matched_sample_count"]),
+        )
+        max_similarity = min(
+            float(forward["max_similarity"]),
+            float(backward["max_similarity"]),
+        )
+
+        if top_average_similarity < config.PERSON_VIDEO_SAMPLE_TOP_AVG_THRESHOLD:
+            return None
+        if matched_sample_count < config.PERSON_VIDEO_MIN_MATCHED_SAMPLES:
+            return None
+
+        return {
+            "centroid_similarity": centroid_similarity,
+            "top_average_similarity": top_average_similarity,
+            "matched_sample_count": float(matched_sample_count),
+            "max_similarity": max_similarity,
+        }
+
+    def _measure_sample_support(
+        self,
+        source_embeddings: list[np.ndarray],
+        target_embeddings: list[np.ndarray],
+    ) -> dict[str, float]:
+        if not source_embeddings or not target_embeddings:
+            return {
+                "max_similarity": 0.0,
+                "top_average_similarity": 0.0,
+                "matched_sample_count": 0.0,
+            }
+
+        per_sample_maxima: list[float] = []
+        for source_embedding in source_embeddings:
+            similarities = [
+                cosine_similarity(source_embedding, target_embedding)
+                for target_embedding in target_embeddings
+            ]
+            if similarities:
+                per_sample_maxima.append(max(similarities))
+
+        if not per_sample_maxima:
+            return {
+                "max_similarity": 0.0,
+                "top_average_similarity": 0.0,
+                "matched_sample_count": 0.0,
+            }
+
+        per_sample_maxima.sort(reverse=True)
+        top_count = min(config.PERSON_VIDEO_SAMPLE_TOP_K, len(per_sample_maxima))
+
+        return {
+            "max_similarity": per_sample_maxima[0],
+            "top_average_similarity": sum(per_sample_maxima[:top_count]) / top_count,
+            "matched_sample_count": float(
+                sum(
+                    1
+                    for similarity in per_sample_maxima
+                    if similarity >= config.PERSON_VIDEO_SAMPLE_MATCH_THRESHOLD
+                )
+            ),
+        }
+
+    def _required_person_links(self, existing_video_count: int) -> int:
+        return min(
+            config.PERSON_MAX_REQUIRED_VIDEO_LINKS,
+            max(1, existing_video_count // 2),
+        )
 
     def _refresh_person_summary(
         self,
@@ -1488,9 +2056,17 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="Re-scan videos even if the DB already has completed rows.")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N discovered videos.")
     parser.add_argument("--path", action="append", default=None, help="Scan a custom file or directory instead of config roots.")
+    parser.add_argument("--regroup", action="store_true", help="Rebuild unlocked groups from stored embeddings after scanning.")
+    parser.add_argument("--regroup-only", action="store_true", help="Skip frame extraction and only rebuild unlocked groups from stored embeddings.")
     args = parser.parse_args()
 
-    scanner = FaceIdentityScanner(force=args.force, limit=args.limit, paths=args.path)
+    scanner = FaceIdentityScanner(
+        force=args.force,
+        limit=args.limit,
+        paths=args.path,
+        regroup_after_scan=args.regroup,
+        regroup_only=args.regroup_only,
+    )
     try:
         return scanner.run()
     finally:
