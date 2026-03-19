@@ -2055,15 +2055,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Scan videos and group same-person works into face_identity_* tables.")
     parser.add_argument("--force", action="store_true", help="Re-scan videos even if the DB already has completed rows.")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N discovered videos.")
+    parser.add_argument("scan_paths", nargs="*", help="Optional file or directory paths to scan.")
     parser.add_argument("--path", action="append", default=None, help="Scan a custom file or directory instead of config roots.")
     parser.add_argument("--regroup", action="store_true", help="Rebuild unlocked groups from stored embeddings after scanning.")
     parser.add_argument("--regroup-only", action="store_true", help="Skip frame extraction and only rebuild unlocked groups from stored embeddings.")
     args = parser.parse_args()
+    input_paths: list[str] = []
+    if args.path:
+        input_paths.extend(args.path)
+    if args.scan_paths:
+        input_paths.extend(args.scan_paths)
 
     scanner = FaceIdentityScanner(
         force=args.force,
         limit=args.limit,
-        paths=args.path,
+        paths=input_paths or None,
         regroup_after_scan=args.regroup,
         regroup_only=args.regroup_only,
     )
