@@ -485,41 +485,112 @@ class FaceExtractorApp:
 
         return max(duration, 0.0)
 
-    def capture_feature_frame(self, video_path: str, capture_second: float, output_path: str) -> None:
+    def capture_feature_frame(
+        self,
+        video_path: str,
+        capture_second: float,
+        output_path: str,
+        excluded_capture_second_keys: Optional[Set[str]] = None,
+    ) -> float:
         ffmpeg_bin = os.environ.get("FFMPEG_BIN", "ffmpeg")
-        last_output = ""
+        failure_messages: List[str] = []
+        excluded_capture_second_keys = excluded_capture_second_keys or set()
 
-        for force_compatible_colorspace in (False, True):
-            if force_compatible_colorspace and not self.should_retry_feature_frame_with_compatible_colorspace(last_output):
-                break
+        for candidate_second in self.build_feature_capture_second_candidates(capture_second, excluded_capture_second_keys):
+            last_output = ""
 
-            if os.path.isfile(output_path):
-                try:
-                    os.remove(output_path)
-                except OSError:
-                    pass
+            for force_compatible_colorspace in (False, True):
+                if force_compatible_colorspace and not self.should_retry_feature_frame_with_compatible_colorspace(last_output):
+                    break
 
-            command = self.build_feature_frame_command(
-                ffmpeg_bin,
-                video_path,
-                capture_second,
-                output_path,
-                force_compatible_colorspace,
-            )
+                last_output = self.run_feature_frame_attempt(
+                    ffmpeg_bin,
+                    video_path,
+                    candidate_second,
+                    output_path,
+                    force_compatible_colorspace,
+                )
 
+                if last_output == "":
+                    return candidate_second
+
+                mode_label = "compatible_colorspace" if force_compatible_colorspace else "default"
+                failure_messages.append(f"[{candidate_second:.3f}s/{mode_label}] {last_output}")
+
+        last_failure = failure_messages[-1] if failure_messages else "ffmpeg 未輸出任何畫面"
+        raise RuntimeError(f"ffmpeg 擷取截圖失敗：{last_failure}")
+
+    def run_feature_frame_attempt(
+        self,
+        ffmpeg_bin: str,
+        video_path: str,
+        capture_second: float,
+        output_path: str,
+        force_compatible_colorspace: bool,
+    ) -> str:
+        if os.path.isfile(output_path):
             try:
-                result = subprocess.run(command, capture_output=True, text=True, timeout=180)
-            except FileNotFoundError as err:
-                raise RuntimeError(f"ffmpeg 不存在：{ffmpeg_bin}") from err
-            except subprocess.TimeoutExpired as err:
-                raise RuntimeError(f"ffmpeg 擷取截圖逾時：{video_path}") from err
+                os.remove(output_path)
+            except OSError:
+                pass
 
-            if result.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
-                return
+        command = self.build_feature_frame_command(
+            ffmpeg_bin,
+            video_path,
+            capture_second,
+            output_path,
+            force_compatible_colorspace,
+        )
 
-            last_output = (result.stderr or result.stdout or "").strip()
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+        except FileNotFoundError as err:
+            raise RuntimeError(f"ffmpeg 不存在：{ffmpeg_bin}") from err
+        except subprocess.TimeoutExpired as err:
+            raise RuntimeError(f"ffmpeg 擷取截圖逾時：{video_path}") from err
 
-        raise RuntimeError(f"ffmpeg 擷取截圖失敗：{last_output}")
+        if result.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+            return ""
+
+        output = (result.stderr or result.stdout or "").strip()
+        if output:
+            return output
+
+        if result.returncode == 0:
+            return "ffmpeg 未輸出任何畫面（可能命中損毀影格或過近 EOF）"
+
+        return f"ffmpeg 失敗，未回傳錯誤訊息 (exit_code={result.returncode})"
+
+    def build_feature_capture_second_candidates(
+        self,
+        capture_second: float,
+        excluded_capture_second_keys: Optional[Set[str]] = None,
+    ) -> List[float]:
+        capture_second = max(round(float(capture_second), 3), 0.0)
+        excluded_capture_second_keys = excluded_capture_second_keys or set()
+        raw_candidates = [
+            capture_second,
+            math.floor(capture_second),
+        ]
+
+        if abs(capture_second - math.floor(capture_second)) >= 0.001:
+            raw_candidates.append(capture_second - 0.5)
+
+        for offset in range(1, 16):
+            raw_candidates.append(math.floor(capture_second) - offset)
+
+        candidates: List[float] = []
+        seen = set()
+
+        for candidate in raw_candidates:
+            normalized = round(max(float(candidate), 0.0), 3)
+            key = f"{normalized:.3f}"
+            if key in seen or key in excluded_capture_second_keys:
+                continue
+            seen.add(key)
+            candidates.append(normalized)
+
+        return candidates
 
     def build_feature_frame_command(
         self,
@@ -533,7 +604,7 @@ class FaceExtractorApp:
             ffmpeg_bin,
             "-hide_banner",
             "-loglevel",
-            "error",
+            "warning",
             "-y",
             "-ss",
             f"{capture_second:.3f}",
@@ -783,6 +854,7 @@ class FaceExtractorApp:
             video_feature_id = int(feature_row[0])
 
             inserted_count = 0
+            used_capture_second_keys: Set[str] = set()
 
             for plan in capture_plan:
                 capture_order = int(plan["capture_order"])
@@ -792,7 +864,13 @@ class FaceExtractorApp:
                 feature_filename = self.build_feature_filename(destination_path, capture_order, label_second)
                 feature_path = os.path.abspath(os.path.join(output_dir, feature_filename))
                 self.ensure_dir(os.path.dirname(feature_path))
-                self.capture_feature_frame(destination_path, capture_second, feature_path)
+                capture_second = self.capture_feature_frame(
+                    destination_path,
+                    capture_second,
+                    feature_path,
+                    used_capture_second_keys,
+                )
+                used_capture_second_keys.add(f"{capture_second:.3f}")
                 created_files.append(feature_path)
 
                 screenshot_db_path = self.build_db_relative_path(output_dir, os.path.basename(feature_path))
