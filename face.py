@@ -487,6 +487,48 @@ class FaceExtractorApp:
 
     def capture_feature_frame(self, video_path: str, capture_second: float, output_path: str) -> None:
         ffmpeg_bin = os.environ.get("FFMPEG_BIN", "ffmpeg")
+        last_output = ""
+
+        for force_compatible_colorspace in (False, True):
+            if force_compatible_colorspace and not self.should_retry_feature_frame_with_compatible_colorspace(last_output):
+                break
+
+            if os.path.isfile(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+
+            command = self.build_feature_frame_command(
+                ffmpeg_bin,
+                video_path,
+                capture_second,
+                output_path,
+                force_compatible_colorspace,
+            )
+
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+            except FileNotFoundError as err:
+                raise RuntimeError(f"ffmpeg 不存在：{ffmpeg_bin}") from err
+            except subprocess.TimeoutExpired as err:
+                raise RuntimeError(f"ffmpeg 擷取截圖逾時：{video_path}") from err
+
+            if result.returncode == 0 and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+                return
+
+            last_output = (result.stderr or result.stdout or "").strip()
+
+        raise RuntimeError(f"ffmpeg 擷取截圖失敗：{last_output}")
+
+    def build_feature_frame_command(
+        self,
+        ffmpeg_bin: str,
+        video_path: str,
+        capture_second: float,
+        output_path: str,
+        force_compatible_colorspace: bool,
+    ) -> List[str]:
         command = [
             ffmpeg_bin,
             "-hide_banner",
@@ -497,23 +539,30 @@ class FaceExtractorApp:
             f"{capture_second:.3f}",
             "-i",
             video_path,
+        ]
+
+        if force_compatible_colorspace:
+            command.extend([
+                "-vf",
+                "colorspace=all=bt709:iall=bt709,format=yuv420p",
+            ])
+
+        command.extend([
             "-frames:v",
             "1",
             "-q:v",
             "3",
             output_path,
-        ]
+        ])
 
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=180)
-        except FileNotFoundError as err:
-            raise RuntimeError(f"ffmpeg 不存在：{ffmpeg_bin}") from err
-        except subprocess.TimeoutExpired as err:
-            raise RuntimeError(f"ffmpeg 擷取截圖逾時：{video_path}") from err
+        return command
 
-        if result.returncode != 0 or not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
-            output = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(f"ffmpeg 擷取截圖失敗：{output}")
+    def should_retry_feature_frame_with_compatible_colorspace(self, output: str) -> bool:
+        output = (output or "").lower()
+        return (
+            "impossible to convert between the formats supported by the filter" in output
+            or ("auto_scale" in output and "function not implemented" in output)
+        )
 
     def find_master_face_id(self, video_master_id: int) -> Optional[int]:
         if not self.db_cursor or not video_master_id:
