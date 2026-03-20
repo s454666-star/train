@@ -2813,9 +2813,13 @@ async def send_message_to_bot(payload: SendBotMessageRequest):
         clear_all_replies()
         clear_invalid_callback_cache()
 
-    await client.send_message(payload.bot_username, payload.text)
+    sent = await client.send_message(payload.bot_username, payload.text)
+    try:
+        sent_message_id = int(getattr(sent, "id", 0) or 0)
+    except Exception:
+        sent_message_id = 0
     await backfill_latest_from_bot(payload.bot_username, limit=160, timeout_seconds=6.0, force=True)
-    return {"status": "ok"}
+    return {"status": "ok", "sent_message_id": sent_message_id}
 
 
 @app.post("/bots/clear-replies")
@@ -5989,6 +5993,7 @@ async def list_bot_dialogs(limit: int = 300):
 
 class RunAllPagesByBotOnlyRequest(BaseModel):
     bot_username: str
+    sent_message_id: int = 0
     clear_previous_replies: bool = False
 
     delay_seconds: int = 0
@@ -6039,7 +6044,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
     timeline: List[Dict[str, Any]] = []
     steps = 0
     visited_pages: Set[int] = set()
-    cleanup_min_mid = 0
+    cleanup_min_mid = int(payload.sent_message_id or 0)
     cleanup_max_mid = 0
     cleanup_after_return_enabled = True
 
@@ -6074,7 +6079,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
             result["debug"] = _get_debug_logs(int(payload.debug_max_logs or 0))
 
         files_unique_count = int(result.get("files_unique_count", 0) or 0)
-        if payload.cleanup_after_done and cleanup_after_return_enabled and files_unique_count <= 0:
+        if payload.cleanup_after_done and cleanup_after_return_enabled:
             try:
                 await _cleanup_chat_after_run(
                     bot_username=payload.bot_username,
@@ -6090,7 +6095,7 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
                     "err": traceback.format_exc()
                 }, max_logs=int(payload.debug_max_logs or 0))
         elif payload.cleanup_after_done and files_unique_count > 0:
-            push_log(stage="cleanup", result="preserve_files_skip", step=steps, extra={
+            push_log(stage="cleanup", result="preserve_files_only", step=steps, extra={
                 "bot_username": payload.bot_username,
                 "files_unique_count": files_unique_count,
                 "cleanup_min_mid": int(cleanup_min_mid or 0),
@@ -6189,9 +6194,11 @@ async def run_all_pages_by_bot(payload: RunAllPagesByBotOnlyRequest) -> Dict[str
 
         if chosen_first.get("message_id"):
             try:
-                cleanup_min_mid = int(chosen_first.get("message_id", 0))
+                chosen_first_mid = int(chosen_first.get("message_id", 0))
+                if chosen_first_mid > 0 and (cleanup_min_mid <= 0 or chosen_first_mid < cleanup_min_mid):
+                    cleanup_min_mid = chosen_first_mid
             except Exception:
-                cleanup_min_mid = 0
+                pass
 
         first_buttons = get_callback_buttons(chosen_first)
         first_pi = extract_page_info(chosen_first.get("text"))
