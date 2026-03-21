@@ -798,6 +798,19 @@ def callback_fingerprint(msg: Dict[str, Any]) -> str:
 def _normalize_button_text(s: Optional[str]) -> str:
     return (str(s or "")).strip().lower()
 
+
+def _button_text_contains_keywords(text: Optional[str], keywords: List[str]) -> bool:
+    normalized_text = _normalize_button_text(text)
+    if not normalized_text:
+        return False
+
+    for kw in (keywords or []):
+        normalized_kw = _normalize_button_text(kw)
+        if normalized_kw and normalized_kw in normalized_text:
+            return True
+
+    return False
+
 def _extract_first_int_from_text(s: Optional[str]) -> Optional[int]:
     if not s:
         return None
@@ -5815,6 +5828,274 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
     except Exception as e:
         push_log(stage="fatal_exception", step=steps, extra={"error": str(e), "trace": traceback.format_exc()}, max_logs=payload.debug_max_logs)
         return await _return_fail("fatal_exception", str(e))
+
+
+class ClickMatchingButtonRequest(BaseModel):
+    bot_username: str
+    sent_message_id: int = 0
+    clear_previous_replies: bool = False
+    delay_seconds: int = 0
+    button_keywords: List[str] = []
+
+    debug: bool = True
+    debug_max_logs: int = 2000
+
+    include_files_in_response: bool = True
+    max_return_files: int = 500
+    max_raw_payload_bytes: int = 0
+
+    wait_after_click_timeout_seconds: int = 8
+
+    cleanup_after_done: bool = False
+    cleanup_scope: str = "run"
+    cleanup_limit: int = 500
+
+    callback_message_max_age_seconds: int = 25
+    callback_candidate_scan_limit: int = 30
+
+
+@app.post("/bots/click-matching-button")
+async def click_matching_button(payload: ClickMatchingButtonRequest) -> Dict[str, Any]:
+    timeline: List[Dict[str, Any]] = []
+    steps = 0
+    cleanup_min_mid = int(payload.sent_message_id or 0)
+    cleanup_max_mid = 0
+    cleanup_after_return_enabled = True
+
+    button_keywords: List[str] = []
+    for kw in (payload.button_keywords or []):
+        normalized = str(kw or "").strip()
+        if normalized and normalized not in button_keywords:
+            button_keywords.append(normalized)
+
+    def _freeze_cleanup_window() -> None:
+        nonlocal cleanup_max_mid
+        lower_bound = int(cleanup_min_mid or 0)
+        if lower_bound <= 0:
+            cleanup_max_mid = 0
+            return
+
+        cleanup_max_mid = max(lower_bound, int(_message_store_max_mid_for_bot(payload.bot_username) or 0))
+
+    async def _build_response(
+        status: str,
+        reason: str,
+        button_clicked: bool = False,
+        clicked_button_text: str = "",
+        clicked_message_id: int = 0,
+        click_effect_observed: bool = False,
+        click_effect_reason: str = ""
+    ) -> Dict[str, Any]:
+        _freeze_cleanup_window()
+        result: Dict[str, Any] = {
+            "status": status,
+            "reason": reason,
+            "steps": steps,
+            "timeline": timeline,
+            "button_clicked": bool(button_clicked),
+            "clicked_button_text": clicked_button_text,
+            "clicked_message_id": int(clicked_message_id or 0),
+            "button_keywords": button_keywords,
+            "click_effect_observed": bool(click_effect_observed),
+            "click_effect_reason": click_effect_reason,
+        }
+
+        result = _attach_bot_result_snapshot(
+            result,
+            bot_username=payload.bot_username,
+            include_files=bool(payload.include_files_in_response),
+            max_return_files=int(payload.max_return_files or 0),
+            max_raw_payload_bytes=int(payload.max_raw_payload_bytes or 0),
+            min_message_id=int(cleanup_min_mid or 0)
+        )
+
+        if payload.debug:
+            result["debug"] = _get_debug_logs(int(payload.debug_max_logs or 0))
+
+        if payload.cleanup_after_done and cleanup_after_return_enabled:
+            try:
+                await _cleanup_chat_after_run(
+                    bot_username=payload.bot_username,
+                    scope=payload.cleanup_scope,
+                    limit=int(payload.cleanup_limit or 0),
+                    min_message_id=int(cleanup_min_mid or 0),
+                    max_message_id=int(cleanup_max_mid or 0),
+                    preserve_file_messages=True,
+                    max_logs=int(payload.debug_max_logs or 0)
+                )
+            except Exception:
+                push_log(stage="cleanup", result="cleanup_error", step=steps, extra={
+                    "err": traceback.format_exc()
+                }, max_logs=int(payload.debug_max_logs or 0))
+
+        return result
+
+    try:
+        if int(payload.delay_seconds or 0) > 0:
+            await asyncio.sleep(float(payload.delay_seconds))
+
+        if payload.clear_previous_replies:
+            try:
+                clear_reply_cache_for_bot(payload.bot_username)
+            except Exception:
+                pass
+
+        if payload.debug:
+            _clear_debug_logs()
+
+        push_log(stage="click_matching_button_start", result="start", step=0, extra={
+            "bot": payload.bot_username,
+            "button_keywords": button_keywords,
+            "cleanup_after_done": bool(payload.cleanup_after_done),
+        }, max_logs=int(payload.debug_max_logs or 0))
+
+        if not button_keywords:
+            timeline.append({"step": 0, "status": "fail", "reason": "button_keywords required"})
+            return await _build_response("fail", "button_keywords required")
+
+        await backfill_latest_from_bot(
+            payload.bot_username,
+            limit=420,
+            timeout_seconds=6.0,
+            max_logs=int(payload.debug_max_logs or 0),
+            step=0,
+            force=True,
+            min_message_id=int(cleanup_min_mid or 0)
+        )
+
+        candidates: List[Dict[str, Any]] = []
+        for msg in MESSAGE_STORE.values():
+            if not _message_matches_bot(msg, payload.bot_username):
+                continue
+
+            mid = int(msg.get("message_id", 0) or 0)
+            if int(cleanup_min_mid or 0) > 0 and mid < int(cleanup_min_mid or 0):
+                continue
+
+            chat_id = int(msg.get("chat_id", 0) or 0)
+            if is_invalid_callback(payload.bot_username, chat_id, mid):
+                continue
+
+            buttons = get_callback_buttons(msg)
+            if not buttons:
+                continue
+
+            for btn in buttons:
+                btn_text = str(btn.get("text", "") or "")
+                if _button_text_contains_keywords(btn_text, button_keywords):
+                    candidates.append({
+                        "message": msg,
+                        "button": btn,
+                        "button_text": btn_text,
+                        "message_id": mid,
+                    })
+                    break
+
+        candidates.sort(key=lambda item: int(item.get("message_id", 0) or 0), reverse=True)
+
+        if not candidates:
+            timeline.append({"step": 0, "status": "fail", "reason": "no matching button found", "button_keywords": button_keywords})
+            return await _build_response("fail", "no matching button found")
+
+        chosen = candidates[0]
+        chosen_msg = chosen["message"]
+        chosen_btn = chosen["button"]
+        chosen_text = str(chosen.get("button_text") or "").strip()
+        chosen_mid = int(chosen.get("message_id", 0) or 0)
+        chosen_chat_id = int(chosen_msg.get("chat_id", 0) or 0)
+
+        if cleanup_min_mid <= 0 or chosen_mid < cleanup_min_mid:
+            cleanup_min_mid = chosen_mid
+
+        timeline.append({
+            "step": 0,
+            "status": "button_candidate",
+            "message_id": chosen_mid,
+            "chat_id": chosen_chat_id,
+            "button_text": chosen_text,
+            "buttons_text": summarize_buttons(get_callback_buttons(chosen_msg)),
+        })
+
+        data_hex = str(chosen_btn.get("data") or "")
+        if not data_hex:
+            timeline.append({"step": 0, "status": "fail", "reason": "matching button missing callback data"})
+            return await _build_response("fail", "matching button missing callback data")
+
+        marker = _pagination_action_marker_from_message(chosen_msg, buttons=get_callback_buttons(chosen_msg))
+        if is_recent_used_callback_action(payload.bot_username, chosen_chat_id, chosen_mid, data_hex, marker=marker):
+            timeline.append({"step": 0, "status": "fail", "reason": "recent_used"})
+            return await _build_response("fail", "recent_used")
+
+        files_meta_before = collect_files_from_store(
+            payload.bot_username,
+            int(payload.max_return_files or 0),
+            int(payload.max_raw_payload_bytes or 0),
+            min_message_id=int(cleanup_min_mid or 0)
+        )
+        files_unique_before = int(files_meta_before.get("files_unique_count", files_meta_before.get("files_count", 0)) or 0)
+
+        await click_callback(payload.bot_username, chosen_chat_id, chosen_mid, data_hex)
+        mark_recent_used_callback_action(payload.bot_username, chosen_chat_id, chosen_mid, data_hex, marker=marker)
+
+        steps = 1
+        timeline.append({
+            "step": steps,
+            "status": "clicked",
+            "message_id": chosen_mid,
+            "chat_id": chosen_chat_id,
+            "button_text": chosen_text,
+        })
+
+        click_effect_observed = False
+        click_effect_reason = ""
+        if int(payload.wait_after_click_timeout_seconds or 0) > 0:
+            click_effect_observed, click_effect_reason = await _wait_for_files_or_state_change(
+                bot_username=payload.bot_username,
+                prev_state_msg_id=chosen_mid,
+                prev_state=chosen_msg,
+                prev_files_unique_count=files_unique_before,
+                min_message_id=int(cleanup_min_mid or 0),
+                timeout_seconds=int(payload.wait_after_click_timeout_seconds or 0),
+                poll_interval=0.35,
+                max_logs=int(payload.debug_max_logs or 0),
+                step=steps,
+                next_keywords=[],
+                max_return_files=int(payload.max_return_files or 0),
+                max_raw_payload_bytes=int(payload.max_raw_payload_bytes or 0)
+            )
+
+        await backfill_latest_from_bot(
+            payload.bot_username,
+            limit=420,
+            timeout_seconds=6.0,
+            max_logs=int(payload.debug_max_logs or 0),
+            step=steps,
+            force=True,
+            min_message_id=int(cleanup_min_mid or 0)
+        )
+
+        timeline.append({
+            "step": steps,
+            "status": "after_click",
+            "reason": click_effect_reason or "clicked",
+            "effect_observed": bool(click_effect_observed),
+        })
+
+        return await _build_response(
+            "ok",
+            "clicked matching button",
+            button_clicked=True,
+            clicked_button_text=chosen_text,
+            clicked_message_id=chosen_mid,
+            click_effect_observed=bool(click_effect_observed),
+            click_effect_reason=click_effect_reason,
+        )
+    except MessageIdInvalidError:
+        timeline.append({"step": max(steps, 1), "status": "fail", "reason": "invalid_callback"})
+        return await _build_response("fail", "invalid_callback")
+    except Exception as e:
+        timeline.append({"step": steps, "status": "fail", "reason": "exception", "err": traceback.format_exc()})
+        return await _build_response("fail", str(e) or "exception")
 
 
 @app.get("/bots/health")
