@@ -45,6 +45,8 @@ DOWNLOAD_RESERVED_PATHS_BY_JOB: Dict[str, Set[str]] = {}
 DOWNLOAD_JOBS: Dict[str, Dict[str, Any]] = {}
 DOWNLOAD_SEEN_KEYS: Set[str] = set()
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
+BACKGROUND_TELETHON_DOWNLOAD_TIMEOUT_SECONDS = 900
+GROUP_TELETHON_DOWNLOAD_TIMEOUT_SECONDS = 180
 
 TDL_EXE_PATH = r"C:\Users\User\Videos\Captures\tdl.exe"
 TDL_DOWNLOAD_THREADS = 12
@@ -2561,6 +2563,54 @@ def _reserve_download_file_path(
         return candidate_path
 
 
+def _cleanup_partial_download_path(file_path: Optional[str]) -> None:
+    try:
+        if file_path and os.path.isfile(file_path):
+            os.remove(file_path)
+    except Exception:
+        pass
+
+
+async def _download_media_with_telethon_timeout(
+    message: Message,
+    file_path: str,
+    timeout_seconds: int
+) -> Dict[str, Any]:
+    started_at = time.time()
+
+    try:
+        await asyncio.wait_for(
+            client.download_media(message, file=file_path),
+            timeout=float(timeout_seconds or 0),
+        )
+        return {
+            "ok": True,
+            "saved_path": file_path,
+            "saved_name": os.path.basename(file_path),
+            "elapsed_seconds": round(time.time() - started_at, 3),
+        }
+    except asyncio.TimeoutError:
+        _cleanup_partial_download_path(file_path)
+        return {
+            "ok": False,
+            "reason": "telethon_download_timeout",
+            "timeout_seconds": int(timeout_seconds or 0),
+            "saved_path": file_path,
+            "saved_name": os.path.basename(file_path),
+            "elapsed_seconds": round(time.time() - started_at, 3),
+        }
+    except Exception as e:
+        _cleanup_partial_download_path(file_path)
+        return {
+            "ok": False,
+            "reason": "telethon_download_error",
+            "error": str(e),
+            "saved_path": file_path,
+            "saved_name": os.path.basename(file_path),
+            "elapsed_seconds": round(time.time() - started_at, 3),
+        }
+
+
 async def _download_one_file_by_message_id(
     bot_username: str,
     peer: Any,
@@ -2601,6 +2651,7 @@ async def _download_one_file_by_message_id(
             )
 
             downloader = "telethon"
+            telethon_result: Dict[str, Any] = {"ok": False, "reason": "not_attempted"}
             tdl_result = await asyncio.to_thread(
                 _run_tdl_download_for_bot_message,
                 bot_username,
@@ -2613,7 +2664,19 @@ async def _download_one_file_by_message_id(
                 downloader = "tdl"
                 file_path = str(tdl_result.get("saved_path") or file_path)
             else:
-                await client.download_media(one, file=file_path)
+                telethon_result = await _download_media_with_telethon_timeout(
+                    one,
+                    file_path,
+                    BACKGROUND_TELETHON_DOWNLOAD_TIMEOUT_SECONDS,
+                )
+                if bool(telethon_result.get("ok")):
+                    file_path = str(telethon_result.get("saved_path") or file_path)
+                else:
+                    reason = str(telethon_result.get("reason") or "telethon_download_failed")
+                    error = str(telethon_result.get("error") or "").strip()
+                    if error:
+                        raise RuntimeError(f"{reason}: {error}")
+                    raise RuntimeError(reason)
 
             job = DOWNLOAD_JOBS.get(job_id) or {}
             job["done"] = int(job.get("done", 0)) + 1
@@ -2630,6 +2693,7 @@ async def _download_one_file_by_message_id(
                     "path": file_path,
                     "downloader": downloader,
                     "tdl": _json_sanitize(tdl_result),
+                    "telethon": _json_sanitize(telethon_result),
                 }
             )
 
@@ -2701,6 +2765,7 @@ async def _download_group_message_media_to_local(
     )
 
     downloader = "telethon"
+    telethon_result: Dict[str, Any] = {"ok": False, "reason": "not_attempted"}
     tdl_result = await asyncio.to_thread(
         _run_tdl_download,
         int(peer_id),
@@ -2713,7 +2778,36 @@ async def _download_group_message_media_to_local(
         downloader = "tdl"
         file_path = str(tdl_result.get("saved_path") or file_path)
     else:
-        await client.download_media(msg, file=file_path)
+        telethon_result = await _download_media_with_telethon_timeout(
+            msg,
+            file_path,
+            GROUP_TELETHON_DOWNLOAD_TIMEOUT_SECONDS,
+        )
+        if bool(telethon_result.get("ok")):
+            file_path = str(telethon_result.get("saved_path") or file_path)
+        else:
+            return {
+                "status": "fail",
+                "downloaded": False,
+                "reason": str(telethon_result.get("reason") or "telethon_download_failed"),
+                "error": str(telethon_result.get("error") or ""),
+                "peer_id": int(peer_id),
+                "message_id": int(message_id),
+                "group_title": group_title,
+                "folder_path": folder_path,
+                "saved_path": telethon_result.get("saved_path"),
+                "saved_name": telethon_result.get("saved_name"),
+                "downloader": downloader,
+                "tdl": _json_sanitize(tdl_result),
+                "telethon": _json_sanitize(telethon_result),
+                "file": {
+                    "file_name": file_obj.get("file_name"),
+                    "mime_type": file_obj.get("mime_type"),
+                    "file_size": int(file_obj.get("file_size", 0) or 0),
+                    "file_type": file_obj.get("file_type"),
+                    "file_unique_id": file_obj.get("file_unique_id"),
+                },
+            }
 
     return {
         "status": "ok",
@@ -2726,6 +2820,7 @@ async def _download_group_message_media_to_local(
         "saved_name": os.path.basename(file_path),
         "downloader": downloader,
         "tdl": _json_sanitize(tdl_result),
+        "telethon": _json_sanitize(telethon_result),
         "file": {
             "file_name": file_obj.get("file_name"),
             "mime_type": file_obj.get("mime_type"),
