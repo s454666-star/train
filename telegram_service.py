@@ -3,7 +3,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetBotCallbackAnswerRequest, DeleteHistoryRequest
-from telethon.tl.types import Message
+from telethon.tl.types import Message, DocumentAttributeFilename, DocumentAttributeVideo
 from telethon.errors.rpcerrorlist import MessageIdInvalidError
 from telethon.errors import FloodWaitError
 
@@ -15,6 +15,8 @@ import traceback
 import zipfile
 import os
 import subprocess
+import json
+import mimetypes
 from typing import Optional, List, Dict, Any, Tuple, Set
 from datetime import datetime, date
 
@@ -47,6 +49,58 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
 TDL_EXE_PATH = r"C:\Users\User\Videos\Captures\tdl.exe"
 TDL_DOWNLOAD_THREADS = 12
 TDL_DOWNLOAD_LIMIT = 32
+FFPROBE_EXE_PATH = r"C:\ffmpeg\bin\ffprobe.exe"
+
+
+def _probe_video_metadata(file_path: str) -> Tuple[Optional[float], Optional[int], Optional[int]]:
+    if not os.path.isfile(file_path) or not os.path.isfile(FFPROBE_EXE_PATH):
+        return None, None, None
+
+    try:
+        proc = subprocess.run(
+            [
+                FFPROBE_EXE_PATH,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height,duration",
+                "-of",
+                "json",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=20,
+            check=True,
+        )
+        payload = json.loads(proc.stdout or "{}")
+        streams = payload.get("streams") or []
+        if not streams:
+            return None, None, None
+
+        stream = streams[0] or {}
+        width = int(stream.get("width") or 0) or None
+        height = int(stream.get("height") or 0) or None
+        duration_raw = stream.get("duration")
+        duration = float(duration_raw) if duration_raw not in (None, "") else None
+        if duration is not None and duration < 0:
+            duration = None
+        return duration, width, height
+    except Exception as e:
+        push_log(
+            stage="probe_video_metadata",
+            result="error",
+            extra={
+                "file_path": file_path,
+                "error": str(e),
+                "trace": traceback.format_exc()[:1200],
+            },
+        )
+        return None, None, None
 
 def _clear_debug_logs():
     try:
@@ -2807,6 +2861,14 @@ class SendBotMessageRequest(BaseModel):
     clear_previous_replies: bool = True
 
 
+class UploadBotVideoRequest(BaseModel):
+    bot_username: str
+    file_path: str
+    caption: Optional[str] = None
+    clear_previous_replies: bool = False
+    supports_streaming: bool = True
+
+
 @app.post("/bots/send")
 async def send_message_to_bot(payload: SendBotMessageRequest):
     if payload.clear_previous_replies:
@@ -2820,6 +2882,87 @@ async def send_message_to_bot(payload: SendBotMessageRequest):
         sent_message_id = 0
     await backfill_latest_from_bot(payload.bot_username, limit=160, timeout_seconds=6.0, force=True)
     return {"status": "ok", "sent_message_id": sent_message_id}
+
+
+@app.post("/bots/upload-video")
+async def upload_video_to_bot(payload: UploadBotVideoRequest):
+    if payload.clear_previous_replies:
+        clear_all_replies()
+        clear_invalid_callback_cache()
+
+    file_path = os.path.abspath(os.path.expanduser((payload.file_path or "").strip()))
+    if not file_path or not os.path.isfile(file_path):
+        return {
+            "status": "error",
+            "reason": "file_not_found",
+            "file_path": file_path,
+        }
+
+    connected = await _ensure_client_connected()
+    if not connected:
+        return {
+            "status": "error",
+            "reason": "client_not_connected",
+            "file_path": file_path,
+        }
+
+    try:
+        duration, width, height = _probe_video_metadata(file_path)
+        mime_type = mimetypes.guess_type(file_path)[0] or "video/mp4"
+        attributes = [
+            DocumentAttributeFilename(os.path.basename(file_path)),
+            DocumentAttributeVideo(
+                duration=duration or 0,
+                w=width or 0,
+                h=height or 0,
+                supports_streaming=bool(payload.supports_streaming),
+            ),
+        ]
+
+        sent = await client.send_file(
+            payload.bot_username,
+            file_path,
+            caption=payload.caption,
+            mime_type=mime_type,
+            attributes=attributes,
+            allow_cache=False,
+            file_size=os.path.getsize(file_path),
+            force_document=False,
+            supports_streaming=bool(payload.supports_streaming),
+            video_note=False,
+        )
+
+        try:
+            sent_message_id = int(getattr(sent, "id", 0) or 0)
+        except Exception:
+            sent_message_id = 0
+
+        sent_as_video = bool(getattr(sent, "video", None))
+
+        return {
+            "status": "ok",
+            "sent_message_id": sent_message_id,
+            "sent_as_video": sent_as_video,
+            "file_path": file_path,
+            "file_name": os.path.basename(file_path),
+        }
+    except Exception as e:
+        push_log(
+            stage="bots_upload_video",
+            result="send_error",
+            extra={
+                "bot_username": payload.bot_username,
+                "file_path": file_path,
+                "error": str(e),
+                "trace": traceback.format_exc()[:1200],
+            },
+        )
+        return {
+            "status": "error",
+            "reason": "send_failed",
+            "error": str(e),
+            "file_path": file_path,
+        }
 
 
 @app.post("/bots/clear-replies")
