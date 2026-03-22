@@ -180,16 +180,91 @@ class LabelOverrides:
         return None
 
 
+@dataclass(frozen=True)
+class DetectorDeviceSelection:
+    requested: str
+    actual: str
+    description: str
+    used_gpu: bool
+
+
+def select_mtcnn_device(use_gpu: bool) -> DetectorDeviceSelection:
+    if not use_gpu:
+        return DetectorDeviceSelection(
+            requested="CPU",
+            actual="CPU:0",
+            description="預設使用 CPU (CPU:0)",
+            used_gpu=False,
+        )
+
+    try:
+        import tensorflow as tf
+    except ImportError:
+        return DetectorDeviceSelection(
+            requested="GPU",
+            actual="CPU:0",
+            description="要求 GPU，但缺少 tensorflow，已改用 CPU (CPU:0)",
+            used_gpu=False,
+        )
+
+    try:
+        physical_gpus = list(tf.config.list_physical_devices("GPU"))
+    except Exception:
+        physical_gpus = []
+
+    if not physical_gpus:
+        built_with_cuda: Optional[bool] = None
+        try:
+            built_with_cuda = bool(tf.test.is_built_with_cuda())
+        except Exception:
+            built_with_cuda = None
+
+        reason = "未偵測到 TensorFlow GPU"
+        if built_with_cuda is False:
+            reason += "，且目前安裝的 TensorFlow 不含 CUDA 支援"
+
+        return DetectorDeviceSelection(
+            requested="GPU",
+            actual="CPU:0",
+            description=f"要求 GPU，但{reason}，已改用 CPU (CPU:0)",
+            used_gpu=False,
+        )
+
+    try:
+        for gpu in physical_gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except Exception:
+        pass
+
+    gpu_name = str(getattr(physical_gpus[0], "name", "GPU:0") or "GPU:0")
+    return DetectorDeviceSelection(
+        requested="GPU",
+        actual="GPU:0",
+        description=f"要求 GPU，使用 GPU:0 | TensorFlow 裝置={gpu_name}",
+        used_gpu=True,
+    )
+
+
 class LooseFaceDetector:
-    def __init__(self, max_side: int = 1280, use_haar_fallback: bool = False) -> None:
+    def __init__(
+        self,
+        max_side: int = 1280,
+        use_haar_fallback: bool = False,
+        use_gpu: bool = False,
+    ) -> None:
         self.max_side = max(int(max_side), 320)
         self.use_haar_fallback = bool(use_haar_fallback)
+        self.device_selection = select_mtcnn_device(use_gpu)
+        self.requested_device = self.device_selection.requested
+        self.active_device = self.device_selection.actual
+        self.device_description = self.device_selection.description
+        self.using_gpu = self.device_selection.used_gpu
         try:
             from mtcnn import MTCNN
         except ImportError as exc:  # pragma: no cover - import guard
             raise SystemExit("缺少 mtcnn，請先安裝 mtcnn。") from exc
 
-        self.mtcnn = MTCNN(device="CPU:0")
+        self.mtcnn = MTCNN(device=self.active_device)
         self.haar_frontal = self._load_cascade("haarcascade_frontalface_default.xml")
         self.haar_profile = self._load_cascade("haarcascade_profileface.xml")
 
@@ -406,6 +481,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--haar-fallback",
         action="store_true",
         help="啟用舊版 Haar 備援；較寬鬆，但比較容易把口罩或非臉輪廓誤判成有人臉。",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="要求 MTCNN 使用 GPU:0；若本機 TensorFlow 沒有可用 GPU，會自動退回 CPU。",
     )
     parser.add_argument(
         "--ignore-overrides",
@@ -1101,6 +1181,7 @@ def run_scan(args: argparse.Namespace) -> int:
         detector = LooseFaceDetector(
             max_side=args.max_side,
             use_haar_fallback=args.haar_fallback,
+            use_gpu=args.gpu,
         )
 
     kept_count = 0
@@ -1122,6 +1203,8 @@ def run_scan(args: argparse.Namespace) -> int:
         print("已忽略既有 log 快取，全部重跑。")
     else:
         print(f"已載入快取紀錄：{len(scan_cache)} 筆")
+    if detector is not None:
+        print(f"偵測裝置：{detector.device_description}")
     print("")
 
     for index, video_path in enumerate(videos, start=1):
