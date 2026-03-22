@@ -7,6 +7,7 @@ __pycache__/
 # Virtualenv
 venv/
 .env/
+.venv_move_no_face_torch/
 
 # Logs
 *.log
