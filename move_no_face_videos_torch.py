@@ -6,7 +6,9 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -490,6 +492,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="忽略既有掃描 log，重新跑偵測並更新紀錄。",
     )
+    parser.add_argument("--child-scan-video", help=argparse.SUPPRESS)
+    parser.add_argument("--child-scan-output", help=argparse.SUPPRESS)
     return parser
 
 
@@ -623,6 +627,38 @@ def result_from_log_entry(entry: dict, video_path: Path) -> VideoScanResult:
         debug_hit=DetectionHit.from_dict(entry.get("debug_hit")),
         debug_hit_second=_optional_float(entry.get("debug_hit_second")),
         debug_hit_reason=str(entry.get("debug_hit_reason") or "").strip() or None,
+    )
+
+
+def result_to_payload(result: VideoScanResult) -> dict[str, object]:
+    return {
+        "video_path": str(result.video_path),
+        "has_face": bool(result.has_face),
+        "checked_frames": int(result.checked_frames),
+        "matched_second": result.matched_second,
+        "matched_detector": result.matched_detector,
+        "moved_to": str(result.moved_to) if result.moved_to is not None else None,
+        "error": result.error,
+        "result_source": result.result_source,
+        "debug_hit": result.debug_hit.to_dict() if result.debug_hit is not None else None,
+        "debug_hit_second": result.debug_hit_second,
+        "debug_hit_reason": result.debug_hit_reason,
+    }
+
+
+def result_from_payload(payload: dict[str, object], fallback_video_path: Path) -> VideoScanResult:
+    return VideoScanResult(
+        video_path=Path(str(payload.get("video_path") or fallback_video_path)),
+        has_face=bool(payload.get("has_face")),
+        checked_frames=int(payload.get("checked_frames") or 0),
+        matched_second=_optional_float(payload.get("matched_second")),
+        matched_detector=str(payload.get("matched_detector") or "").strip() or None,
+        moved_to=Path(str(payload["moved_to"])) if payload.get("moved_to") else None,
+        error=str(payload.get("error") or "").strip() or None,
+        result_source=str(payload.get("result_source") or "").strip() or None,
+        debug_hit=DetectionHit.from_dict(payload.get("debug_hit")),
+        debug_hit_second=_optional_float(payload.get("debug_hit_second")),
+        debug_hit_reason=str(payload.get("debug_hit_reason") or "").strip() or None,
     )
 
 
@@ -1123,6 +1159,132 @@ def scan_video_for_face(
         capture.release()
 
 
+def summarize_child_output(text: str) -> Optional[str]:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    summary = " | ".join(lines[-2:])
+    if len(summary) > 240:
+        summary = summary[-240:]
+    return summary
+
+
+def format_exit_code(returncode: int) -> str:
+    if os.name == "nt" and returncode < 0:
+        return f"signal {-returncode}"
+    if os.name == "nt":
+        return f"0x{returncode & 0xFFFFFFFF:08X}"
+    if returncode < 0:
+        return f"signal {-returncode}"
+    return str(returncode)
+
+
+def scan_video_for_face_isolated(video_path: Path, args: argparse.Namespace) -> VideoScanResult:
+    temp_handle, temp_output = tempfile.mkstemp(prefix="face-scan-", suffix=".json")
+    os.close(temp_handle)
+    output_path = Path(temp_output)
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--interval",
+        str(args.interval),
+        "--max-side",
+        str(args.max_side),
+        "--child-scan-video",
+        str(video_path),
+        "--child-scan-output",
+        str(output_path),
+    ]
+    if args.gpu:
+        command.append("--gpu")
+    if args.haar_fallback:
+        command.append("--haar-fallback")
+
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if output_path.exists():
+            try:
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                summary = summarize_child_output(completed.stderr) or summarize_child_output(completed.stdout)
+                detail = f"子程序結果檔無法解析 ({exc})"
+                if summary:
+                    detail = f"{detail} | {summary}"
+                return VideoScanResult(
+                    video_path=video_path,
+                    has_face=False,
+                    checked_frames=0,
+                    error=detail,
+                    result_source="scan",
+                )
+
+            result = result_from_payload(payload, video_path)
+            if not result.result_source:
+                result.result_source = "scan"
+            result.video_path = video_path
+            return result
+
+        summary = summarize_child_output(completed.stderr) or summarize_child_output(completed.stdout)
+        error_text = f"子程序崩潰 | exit={format_exit_code(completed.returncode)}"
+        if summary:
+            error_text = f"{error_text} | {summary}"
+        return VideoScanResult(
+            video_path=video_path,
+            has_face=False,
+            checked_frames=0,
+            error=error_text,
+            result_source="scan",
+        )
+    except Exception as exc:
+        return VideoScanResult(
+            video_path=video_path,
+            has_face=False,
+            checked_frames=0,
+            error=f"子程序啟動失敗 | {exc}",
+            result_source="scan",
+        )
+    finally:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def run_child_scan(args: argparse.Namespace) -> int:
+    video_path = Path(str(args.child_scan_video or "")).expanduser().resolve()
+    output_path = Path(str(args.child_scan_output or "")).expanduser().resolve()
+
+    try:
+        detector = LooseFaceDetector(
+            max_side=args.max_side,
+            use_haar_fallback=args.haar_fallback,
+            use_gpu=args.gpu,
+        )
+        result = scan_video_for_face(video_path, detector, args.interval)
+    except BaseException as exc:
+        result = VideoScanResult(
+            video_path=video_path,
+            has_face=False,
+            checked_frames=0,
+            error=f"子程序例外 | {exc}",
+            result_source="scan",
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(result_to_payload(result), ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return 0
+
+
 def build_unique_destination(destination_dir: Path, source_path: Path) -> Path:
     destination_dir.mkdir(parents=True, exist_ok=True)
     candidate = destination_dir / source_path.name
@@ -1169,13 +1331,9 @@ def run_scan(args: argparse.Namespace) -> int:
     else:
         unclassified_exists = True
 
-    detector: Optional[LooseFaceDetector] = None
+    device_selection: Optional[DetectorDeviceSelection] = None
     if unclassified_exists:
-        detector = LooseFaceDetector(
-            max_side=args.max_side,
-            use_haar_fallback=args.haar_fallback,
-            use_gpu=args.gpu,
-        )
+        device_selection = select_mtcnn_device(args.gpu)
 
     kept_count = 0
     moved_count = 0
@@ -1196,8 +1354,9 @@ def run_scan(args: argparse.Namespace) -> int:
         print("已忽略既有 log 快取，全部重跑。")
     else:
         print(f"已載入快取紀錄：{len(scan_cache)} 筆")
-    if detector is not None:
-        print(f"偵測裝置：{detector.device_description}")
+    if device_selection is not None:
+        print(f"偵測裝置：{device_selection.description}")
+        print("掃描模式：每支影片用獨立子程序；單支影片崩潰不會中斷整批。")
     print("")
 
     for index, video_path in enumerate(videos, start=1):
@@ -1215,7 +1374,7 @@ def run_scan(args: argparse.Namespace) -> int:
         elif not args.rescan and cache_key and cache_key in scan_cache:
             result = result_from_log_entry(scan_cache[cache_key], video_path)
         else:
-            if detector is None:
+            if device_selection is None:
                 result = VideoScanResult(
                     video_path=video_path,
                     has_face=False,
@@ -1224,7 +1383,7 @@ def run_scan(args: argparse.Namespace) -> int:
                     result_source="scan",
                 )
             else:
-                result = scan_video_for_face(video_path, detector, args.interval)
+                result = scan_video_for_face_isolated(video_path, args)
                 gc.collect()
 
         action = "error"
@@ -1292,6 +1451,8 @@ def run_scan(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.child_scan_video and args.child_scan_output:
+        return run_child_scan(args)
     return run_scan(args)
 
 
