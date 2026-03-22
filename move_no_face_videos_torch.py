@@ -43,6 +43,7 @@ NO_FACE_FOLDER_NAME = "無人臉檔案"
 ROTATION_ANGLES = (0, 90, 270)
 MAX_SAMPLED_FRAMES_PER_VIDEO = 1800
 MAX_CONSECUTIVE_READ_FAILURES = 12
+GPU_DETECTION_BATCH_SIZE = 8
 MIN_FACE_SIDE = 120
 LARGE_FACE_SIDE = 300
 MIN_LOWER_FACE_SKIN_RATIO = 0.30
@@ -243,6 +244,7 @@ class LooseFaceDetector:
         self.active_device = self.device_selection.actual
         self.device_description = self.device_selection.description
         self.using_gpu = self.device_selection.used_gpu
+        self.detect_batch_size = GPU_DETECTION_BATCH_SIZE if self.using_gpu else 1
         try:
             import torch
             from facenet_pytorch import MTCNN
@@ -271,36 +273,62 @@ class LooseFaceDetector:
         return cascade
 
     def frame_has_face(self, frame_bgr) -> Optional[DetectionHit]:
-        best_weak_hit: Optional[DetectionHit] = None
+        return self.frame_has_faces([frame_bgr])[0]
 
-        for angle in ROTATION_ANGLES:
-            rotated = frame_bgr if angle == 0 else rotate_image(frame_bgr, angle)
-            prepared = prepare_for_detection(rotated, self.max_side)
+    def frame_has_faces(self, frames_bgr) -> list[Optional[DetectionHit]]:
+        if not frames_bgr:
+            return []
 
-            mtcnn_hit = self._mtcnn_hit(prepared, angle)
-            if mtcnn_hit is not None:
-                if not mtcnn_hit.requires_confirmation:
-                    return mtcnn_hit
-                if best_weak_hit is None:
-                    best_weak_hit = mtcnn_hit
+        prepared_entries: list[tuple[int, int, object]] = []
+        prepared_by_key: dict[tuple[int, int], object] = {}
+        for frame_index, frame_bgr in enumerate(frames_bgr):
+            for angle in ROTATION_ANGLES:
+                rotated = frame_bgr if angle == 0 else rotate_image(frame_bgr, angle)
+                prepared = prepare_for_detection(rotated, self.max_side)
+                prepared_entries.append((frame_index, angle, prepared))
+                prepared_by_key[(frame_index, angle)] = prepared
 
-            if self.use_haar_fallback:
-                haar_hit = self._haar_hit(prepared, angle)
-                if haar_hit is not None:
-                    return haar_hit
+        mtcnn_hits_by_key: dict[tuple[int, int], Optional[DetectionHit]] = {}
+        if prepared_entries:
+            batch_hits = self._mtcnn_hits_batch(
+                [(angle, prepared) for _, angle, prepared in prepared_entries]
+            )
+            for (frame_index, angle, _), hit in zip(prepared_entries, batch_hits):
+                mtcnn_hits_by_key[(frame_index, angle)] = hit
 
-        return best_weak_hit
+        results: list[Optional[DetectionHit]] = []
+        for frame_index, _ in enumerate(frames_bgr):
+            best_weak_hit: Optional[DetectionHit] = None
+            accepted_hit: Optional[DetectionHit] = None
+            for angle in ROTATION_ANGLES:
+                prepared = prepared_by_key[(frame_index, angle)]
 
-    def _mtcnn_hit(self, frame_bgr, angle: int) -> Optional[DetectionHit]:
-        try:
-            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            rgb = rgb.astype("uint8", copy=False)
-            rgb = rgb.copy(order="C")
-            with self.torch.inference_mode():
-                boxes, probabilities, landmarks = self.mtcnn.detect(rgb, landmarks=True)
-        except Exception:
-            return None
+                mtcnn_hit = mtcnn_hits_by_key.get((frame_index, angle))
+                if mtcnn_hit is not None:
+                    if not mtcnn_hit.requires_confirmation:
+                        accepted_hit = mtcnn_hit
+                        break
+                    if best_weak_hit is None:
+                        best_weak_hit = mtcnn_hit
 
+                if self.use_haar_fallback:
+                    haar_hit = self._haar_hit(prepared, angle)
+                    if haar_hit is not None:
+                        accepted_hit = haar_hit
+                        break
+
+            results.append(accepted_hit if accepted_hit is not None else best_weak_hit)
+
+        return results
+
+    def _mtcnn_hit_from_detection(
+        self,
+        frame_bgr,
+        angle: int,
+        boxes,
+        probabilities,
+        landmarks,
+    ) -> Optional[DetectionHit]:
         if boxes is None or landmarks is None or probabilities is None:
             return None
 
@@ -356,7 +384,7 @@ class LooseFaceDetector:
                 if geometry["vertical_ratio"] > MAX_VERTICAL_RATIO:
                     continue
 
-            hit = DetectionHit(
+            return DetectionHit(
                 detector="MTCNN",
                 angle=angle,
                 width=width,
@@ -371,9 +399,56 @@ class LooseFaceDetector:
                 requires_confirmation=requires_confirmation,
             )
 
-            return hit
-
         return None
+
+    def _mtcnn_hits_batch(self, entries: list[tuple[int, object]]) -> list[Optional[DetectionHit]]:
+        if not entries:
+            return []
+
+        try:
+            rgb_batch = []
+            for _, frame_bgr in entries:
+                rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                rgb = rgb.astype("uint8", copy=False)
+                rgb_batch.append(rgb.copy(order="C"))
+
+            with self.torch.inference_mode():
+                boxes_batch, probabilities_batch, landmarks_batch = self.mtcnn.detect(
+                    rgb_batch,
+                    landmarks=True,
+                )
+        except Exception:
+            return [self._mtcnn_hit(frame_bgr, angle) for angle, frame_bgr in entries]
+
+        hits: list[Optional[DetectionHit]] = []
+        for (angle, frame_bgr), boxes, probabilities, landmarks in zip(
+            entries,
+            boxes_batch,
+            probabilities_batch,
+            landmarks_batch,
+        ):
+            hits.append(
+                self._mtcnn_hit_from_detection(
+                    frame_bgr,
+                    angle,
+                    boxes,
+                    probabilities,
+                    landmarks,
+                )
+            )
+        return hits
+
+    def _mtcnn_hit(self, frame_bgr, angle: int) -> Optional[DetectionHit]:
+        try:
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            rgb = rgb.astype("uint8", copy=False)
+            rgb = rgb.copy(order="C")
+            with self.torch.inference_mode():
+                boxes, probabilities, landmarks = self.mtcnn.detect(rgb, landmarks=True)
+        except Exception:
+            return None
+
+        return self._mtcnn_hit_from_detection(frame_bgr, angle, boxes, probabilities, landmarks)
 
     def _haar_hit(self, frame_bgr, angle: int) -> Optional[DetectionHit]:
         if self.haar_frontal is None and self.haar_profile is None:
@@ -492,6 +567,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="忽略既有掃描 log，重新跑偵測並更新紀錄。",
     )
+    parser.add_argument("--worker-loop", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--child-scan-video", help=argparse.SUPPRESS)
     parser.add_argument("--child-scan-output", help=argparse.SUPPRESS)
     return parser
@@ -1031,6 +1107,18 @@ def iter_sampled_frames(
         yield current_second, frame
 
 
+def iter_batches(items, batch_size: int):
+    effective_batch_size = max(int(batch_size), 1)
+    batch = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= effective_batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def scan_video_for_face(
     video_path: Path,
     detector: LooseFaceDetector,
@@ -1053,47 +1141,52 @@ def scan_video_for_face(
         best_debug_hit: Optional[DetectionHit] = None
         best_debug_second: Optional[float] = None
         best_debug_reason: Optional[str] = None
-        for second, frame in iter_sampled_frames(capture, fps, interval_seconds):
-            checked_frames += 1
+        for sampled_batch in iter_batches(
+            iter_sampled_frames(capture, fps, interval_seconds),
+            detector.detect_batch_size,
+        ):
+            frames = [frame for _, frame in sampled_batch]
             try:
-                hit = detector.frame_has_face(frame)
+                hits = detector.frame_has_faces(frames)
             except Exception:
-                continue
-            if hit is None:
-                continue
+                hits = [None] * len(sampled_batch)
 
-            rejection_reason = evaluate_hit_rejection_reason(second, hit)
-            if best_debug_hit is None or hit_debug_score(hit) > hit_debug_score(best_debug_hit):
-                best_debug_hit = hit
-                best_debug_second = second
-                best_debug_reason = rejection_reason or "accepted"
+            for (second, _), hit in zip(sampled_batch, hits):
+                checked_frames += 1
+                if hit is None:
+                    continue
 
-            if rejection_reason is not None:
-                continue
+                rejection_reason = evaluate_hit_rejection_reason(second, hit)
+                if best_debug_hit is None or hit_debug_score(hit) > hit_debug_score(best_debug_hit):
+                    best_debug_hit = hit
+                    best_debug_second = second
+                    best_debug_reason = rejection_reason or "accepted"
 
-            if hit.requires_confirmation:
-                if pending_weak_hit is not None:
-                    previous_second, previous_hit = pending_weak_hit
-                    if (
-                        second - previous_second <= max(interval_seconds * 2.5, 1.0)
-                        and previous_hit.angle == hit.angle
-                    ):
-                        return VideoScanResult(
-                            video_path=video_path,
-                            has_face=True,
-                            checked_frames=checked_frames,
-                            matched_second=second,
-                            matched_detector=f"{hit.label}-confirmed",
-                            result_source="scan",
-                            debug_hit=hit,
-                            debug_hit_second=second,
-                            debug_hit_reason="accepted-confirmed",
-                        )
+                if rejection_reason is not None:
+                    continue
 
-                pending_weak_hit = (second, hit)
-                continue
+                if hit.requires_confirmation:
+                    if pending_weak_hit is not None:
+                        previous_second, previous_hit = pending_weak_hit
+                        if (
+                            second - previous_second <= max(interval_seconds * 2.5, 1.0)
+                            and previous_hit.angle == hit.angle
+                        ):
+                            return VideoScanResult(
+                                video_path=video_path,
+                                has_face=True,
+                                checked_frames=checked_frames,
+                                matched_second=second,
+                                matched_detector=f"{hit.label}-confirmed",
+                                result_source="scan",
+                                debug_hit=hit,
+                                debug_hit_second=second,
+                                debug_hit_reason="accepted-confirmed",
+                            )
 
-            if not hit.requires_confirmation:
+                    pending_weak_hit = (second, hit)
+                    continue
+
                 return VideoScanResult(
                     video_path=video_path,
                     has_face=True,
@@ -1111,37 +1204,43 @@ def scan_video_for_face(
             tail_capture = cv2.VideoCapture(str(video_path))
             try:
                 if tail_capture.isOpened():
+                    tail_samples = []
                     for second in tail_probe_seconds:
                         success, frame = read_frame_at_second(tail_capture, second, fps, frame_count)
                         if not success or frame is None:
                             continue
+                        tail_samples.append((second, frame))
+
+                    if tail_samples:
                         try:
-                            hit = detector.frame_has_face(frame)
+                            tail_hits = detector.frame_has_faces([frame for _, frame in tail_samples])
                         except Exception:
-                            continue
-                        if hit is None:
-                            continue
+                            tail_hits = [None] * len(tail_samples)
 
-                        rejection_reason = evaluate_hit_rejection_reason(second, hit)
-                        if best_debug_hit is None or hit_debug_score(hit) > hit_debug_score(best_debug_hit):
-                            best_debug_hit = hit
-                            best_debug_second = second
-                            best_debug_reason = rejection_reason or "accepted-tail"
+                        for (second, _), hit in zip(tail_samples, tail_hits):
+                            if hit is None:
+                                continue
 
-                        if rejection_reason is not None:
-                            continue
+                            rejection_reason = evaluate_hit_rejection_reason(second, hit)
+                            if best_debug_hit is None or hit_debug_score(hit) > hit_debug_score(best_debug_hit):
+                                best_debug_hit = hit
+                                best_debug_second = second
+                                best_debug_reason = rejection_reason or "accepted-tail"
 
-                        return VideoScanResult(
-                            video_path=video_path,
-                            has_face=True,
-                            checked_frames=checked_frames,
-                            matched_second=second,
-                            matched_detector=hit.label,
-                            result_source="scan",
-                            debug_hit=hit,
-                            debug_hit_second=second,
-                            debug_hit_reason="accepted-tail",
-                        )
+                            if rejection_reason is not None:
+                                continue
+
+                            return VideoScanResult(
+                                video_path=video_path,
+                                has_face=True,
+                                checked_frames=checked_frames,
+                                matched_second=second,
+                                matched_detector=hit.label,
+                                result_source="scan",
+                                debug_hit=hit,
+                                debug_hit_second=second,
+                                debug_hit_reason="accepted-tail",
+                            )
             finally:
                 tail_capture.release()
 
@@ -1177,6 +1276,155 @@ def format_exit_code(returncode: int) -> str:
     if returncode < 0:
         return f"signal {-returncode}"
     return str(returncode)
+
+
+class PersistentScanWorker:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.process: Optional[subprocess.Popen] = None
+
+    def _build_command(self) -> list[str]:
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--interval",
+            str(self.args.interval),
+            "--max-side",
+            str(self.args.max_side),
+            "--worker-loop",
+        ]
+        if self.args.gpu:
+            command.append("--gpu")
+        if self.args.haar_fallback:
+            command.append("--haar-fallback")
+        return command
+
+    def _ensure_started(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            return
+        self.close()
+        self.process = subprocess.Popen(
+            self._build_command(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+    def _crash_result(self, video_path: Path) -> VideoScanResult:
+        stderr_output = ""
+        exit_code = "unknown"
+        if self.process is not None:
+            return_code = self.process.poll()
+            if return_code is not None:
+                exit_code = format_exit_code(return_code)
+            if self.process.stderr is not None:
+                try:
+                    stderr_output = self.process.stderr.read()
+                except Exception:
+                    stderr_output = ""
+        self.close()
+        summary = summarize_child_output(stderr_output)
+        error_text = f"子程序崩潰 | exit={exit_code}"
+        if summary:
+            error_text = f"{error_text} | {summary}"
+        return VideoScanResult(
+            video_path=video_path,
+            has_face=False,
+            checked_frames=0,
+            error=error_text,
+            result_source="scan",
+        )
+
+    def scan(self, video_path: Path) -> VideoScanResult:
+        last_error: Optional[VideoScanResult] = None
+        for _ in range(2):
+            self._ensure_started()
+            if self.process is None or self.process.stdin is None or self.process.stdout is None:
+                return VideoScanResult(
+                    video_path=video_path,
+                    has_face=False,
+                    checked_frames=0,
+                    error="子程序啟動失敗",
+                    result_source="scan",
+                )
+
+            try:
+                request = json.dumps({"video_path": str(video_path)}, ensure_ascii=False)
+                self.process.stdin.write(request + "\n")
+                self.process.stdin.flush()
+                response_line = self.process.stdout.readline()
+            except Exception as exc:
+                last_error = VideoScanResult(
+                    video_path=video_path,
+                    has_face=False,
+                    checked_frames=0,
+                    error=f"子程序通訊失敗 | {exc}",
+                    result_source="scan",
+                )
+                self.close()
+                continue
+
+            if not response_line:
+                last_error = self._crash_result(video_path)
+                continue
+
+            try:
+                payload = json.loads(response_line)
+            except json.JSONDecodeError:
+                last_error = VideoScanResult(
+                    video_path=video_path,
+                    has_face=False,
+                    checked_frames=0,
+                    error=f"子程序回傳無法解析 | {response_line.strip()[:240]}",
+                    result_source="scan",
+                )
+                self.close()
+                continue
+
+            result = result_from_payload(payload, video_path)
+            if not result.result_source:
+                result.result_source = "scan"
+            result.video_path = video_path
+            return result
+
+        return last_error or VideoScanResult(
+            video_path=video_path,
+            has_face=False,
+            checked_frames=0,
+            error="子程序失敗",
+            result_source="scan",
+        )
+
+    def close(self) -> None:
+        if self.process is None:
+            return
+        process = self.process
+        self.process = None
+        try:
+            if process.stdin is not None:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
+            if process.poll() is None:
+                process.wait(timeout=1)
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+        finally:
+            for handle in (process.stdout, process.stderr):
+                if handle is None:
+                    continue
+                try:
+                    handle.close()
+                except Exception:
+                    pass
 
 
 def scan_video_for_face_isolated(video_path: Path, args: argparse.Namespace) -> VideoScanResult:
@@ -1285,6 +1533,46 @@ def run_child_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_worker_loop(args: argparse.Namespace) -> int:
+    detector = LooseFaceDetector(
+        max_side=args.max_side,
+        use_haar_fallback=args.haar_fallback,
+        use_gpu=args.gpu,
+    )
+
+    for raw_line in sys.stdin:
+        request_line = raw_line.strip()
+        if not request_line:
+            continue
+
+        try:
+            request = json.loads(request_line)
+        except json.JSONDecodeError:
+            continue
+
+        video_text = str(request.get("video_path") or "").strip()
+        if not video_text:
+            continue
+
+        video_path = Path(video_text).expanduser().resolve()
+        try:
+            result = scan_video_for_face(video_path, detector, args.interval)
+        except BaseException as exc:
+            result = VideoScanResult(
+                video_path=video_path,
+                has_face=False,
+                checked_frames=0,
+                error=f"子程序例外 | {exc}",
+                result_source="scan",
+            )
+
+        sys.stdout.write(json.dumps(result_to_payload(result), ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        gc.collect()
+
+    return 0
+
+
 def build_unique_destination(destination_dir: Path, source_path: Path) -> Path:
     destination_dir.mkdir(parents=True, exist_ok=True)
     candidate = destination_dir / source_path.name
@@ -1356,9 +1644,13 @@ def run_scan(args: argparse.Namespace) -> int:
         print(f"已載入快取紀錄：{len(scan_cache)} 筆")
     if device_selection is not None:
         print(f"偵測裝置：{device_selection.description}")
-        print("掃描模式：每支影片用獨立子程序；單支影片崩潰不會中斷整批。")
+        print(
+            "掃描模式：長駐子程序重複使用模型；若單支影片讓子程序崩潰，"
+            "會自動重開後繼續下一支。"
+        )
     print("")
 
+    worker = PersistentScanWorker(args) if device_selection is not None else None
     for index, video_path in enumerate(videos, start=1):
         signature = build_video_signature(video_path, root_dir)
         override_value = overrides.classify(video_path.name) if use_overrides else None
@@ -1383,7 +1675,7 @@ def run_scan(args: argparse.Namespace) -> int:
                     result_source="scan",
                 )
             else:
-                result = scan_video_for_face_isolated(video_path, args)
+                result = worker.scan(video_path) if worker is not None else scan_video_for_face_isolated(video_path, args)
                 gc.collect()
 
         action = "error"
@@ -1439,6 +1731,9 @@ def run_scan(args: argparse.Namespace) -> int:
         if cache_key and not result.error:
             scan_cache[cache_key] = entry
 
+    if worker is not None:
+        worker.close()
+
     print("")
     print(
         "掃描完成 | "
@@ -1451,6 +1746,8 @@ def run_scan(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if args.worker_loop:
+        return run_worker_loop(args)
     if args.child_scan_video and args.child_scan_output:
         return run_child_scan(args)
     return run_scan(args)
