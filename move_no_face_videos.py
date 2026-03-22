@@ -8,6 +8,7 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -59,6 +60,7 @@ LATE_ROTATED_NOSE_OFFSET_RATIO = 0.33
 LATE_ROTATED_MOUTH_EYE_RATIO = 0.88
 LATE_ROTATED_STRICT_MOUTH_EYE_RATIO = 0.92
 OVERRIDES_PATH = Path(__file__).with_name("move_no_face_videos_overrides.json")
+SCAN_LOG_FILE_NAME = "face_scan_log.jsonl"
 
 
 try:
@@ -81,6 +83,10 @@ class VideoScanResult:
     matched_detector: Optional[str] = None
     moved_to: Optional[Path] = None
     error: Optional[str] = None
+    result_source: Optional[str] = None
+    debug_hit: Optional["DetectionHit"] = None
+    debug_hit_second: Optional[float] = None
+    debug_hit_reason: Optional[str] = None
 
 
 @dataclass
@@ -102,6 +108,47 @@ class DetectionHit:
     def label(self) -> str:
         suffix = "-weak" if self.requires_confirmation else ""
         return f"{self.detector}{suffix}@{self.angle}"
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "detector": self.detector,
+            "angle": self.angle,
+            "width": self.width,
+            "height": self.height,
+            "confidence": self.confidence,
+            "lower_skin_ratio": self.lower_skin_ratio,
+            "eye_angle": self.eye_angle,
+            "nose_offset_ratio": self.nose_offset_ratio,
+            "mouth_offset_ratio": self.mouth_offset_ratio,
+            "vertical_ratio": self.vertical_ratio,
+            "mouth_eye_ratio": self.mouth_eye_ratio,
+            "requires_confirmation": self.requires_confirmation,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Optional[dict[str, object]]) -> Optional["DetectionHit"]:
+        if not isinstance(payload, dict):
+            return None
+        detector = str(payload.get("detector") or "").strip()
+        if not detector:
+            return None
+        try:
+            return cls(
+                detector=detector,
+                angle=int(payload.get("angle") or 0),
+                width=int(payload.get("width") or 0),
+                height=int(payload.get("height") or 0),
+                confidence=_optional_float(payload.get("confidence")),
+                lower_skin_ratio=_optional_float(payload.get("lower_skin_ratio")),
+                eye_angle=_optional_float(payload.get("eye_angle")),
+                nose_offset_ratio=_optional_float(payload.get("nose_offset_ratio")),
+                mouth_offset_ratio=_optional_float(payload.get("mouth_offset_ratio")),
+                vertical_ratio=_optional_float(payload.get("vertical_ratio")),
+                mouth_eye_ratio=_optional_float(payload.get("mouth_eye_ratio")),
+                requires_confirmation=bool(payload.get("requires_confirmation") or False),
+            )
+        except Exception:
+            return None
 
 
 @dataclass
@@ -350,6 +397,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="忽略已標記案例，強制用實際偵測重新掃描。",
     )
+    parser.add_argument(
+        "--rescan",
+        action="store_true",
+        help="忽略既有掃描 log，重新跑偵測並更新紀錄。",
+    )
     return parser
 
 
@@ -370,6 +422,18 @@ def resolve_target_path(raw_target: Optional[str]) -> Path:
 
 def normalize_file_name(file_name: str) -> str:
     return str(file_name or "").strip().lower()
+
+
+def _optional_float(value) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return numeric
 
 
 def load_label_overrides(path: Path = OVERRIDES_PATH) -> LabelOverrides:
@@ -396,6 +460,115 @@ def load_label_overrides(path: Path = OVERRIDES_PATH) -> LabelOverrides:
         known_face_files=known_face,
         known_no_face_files=known_no_face,
     )
+
+
+def build_scan_log_path(root_dir: Path) -> Path:
+    return root_dir / SCAN_LOG_FILE_NAME
+
+
+def safe_relative_video_path(video_path: Path, root_dir: Path) -> str:
+    try:
+        return str(video_path.relative_to(root_dir))
+    except ValueError:
+        return str(video_path)
+
+
+def build_video_signature(video_path: Path, root_dir: Path) -> Optional[dict[str, object]]:
+    try:
+        stat = video_path.stat()
+    except OSError:
+        return None
+
+    mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+    relative_path = safe_relative_video_path(video_path, root_dir)
+    return {
+        "relative_path": relative_path,
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": mtime_ns,
+        "cache_key": f"{normalize_file_name(relative_path)}|{int(stat.st_size)}|{mtime_ns}",
+    }
+
+
+def load_scan_log_cache(log_path: Path) -> dict[str, dict]:
+    if not log_path.exists():
+        return {}
+
+    cache: dict[str, dict] = {}
+    try:
+        with log_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    entry = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+
+                cache_key = str(entry.get("cache_key") or "").strip()
+                if not cache_key:
+                    continue
+                if entry.get("error"):
+                    continue
+                cache[cache_key] = entry
+    except OSError:
+        return {}
+
+    return cache
+
+
+def append_scan_log_entry(log_path: Path, entry: dict[str, object]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def result_from_log_entry(entry: dict, video_path: Path) -> VideoScanResult:
+    return VideoScanResult(
+        video_path=video_path,
+        has_face=bool(entry.get("has_face")),
+        checked_frames=int(entry.get("checked_frames") or 0),
+        matched_second=_optional_float(entry.get("matched_second")),
+        matched_detector=str(entry.get("matched_detector") or "").strip() or None,
+        error=str(entry.get("error") or "").strip() or None,
+        result_source="cache",
+        debug_hit=DetectionHit.from_dict(entry.get("debug_hit")),
+        debug_hit_second=_optional_float(entry.get("debug_hit_second")),
+        debug_hit_reason=str(entry.get("debug_hit_reason") or "").strip() or None,
+    )
+
+
+def build_scan_log_entry(
+    *,
+    video_path: Path,
+    root_dir: Path,
+    result: VideoScanResult,
+    signature: Optional[dict[str, object]],
+    action: str,
+    dry_run: bool,
+) -> dict[str, object]:
+    signature = signature or build_video_signature(video_path, root_dir) or {}
+    return {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "video_path": str(video_path),
+        "relative_path": signature.get("relative_path") or safe_relative_video_path(video_path, root_dir),
+        "file_name": video_path.name,
+        "size_bytes": signature.get("size_bytes"),
+        "mtime_ns": signature.get("mtime_ns"),
+        "cache_key": signature.get("cache_key"),
+        "has_face": bool(result.has_face),
+        "checked_frames": int(result.checked_frames),
+        "matched_second": result.matched_second,
+        "matched_detector": result.matched_detector,
+        "error": result.error,
+        "result_source": result.result_source,
+        "debug_hit": result.debug_hit.to_dict() if result.debug_hit is not None else None,
+        "debug_hit_second": result.debug_hit_second,
+        "debug_hit_reason": result.debug_hit_reason,
+        "moved_to": str(result.moved_to) if result.moved_to is not None else None,
+        "action": action,
+        "dry_run": bool(dry_run),
+    }
 
 
 def iter_videos(target_path: Path, recursive: bool = True) -> Iterable[Path]:
@@ -498,6 +671,64 @@ def compute_face_geometry(keypoints: dict) -> Optional[dict[str, float]]:
         "vertical_ratio": eye_to_mouth / eye_distance,
         "mouth_eye_ratio": mouth_width / eye_distance,
     }
+
+
+def hit_debug_score(hit: DetectionHit) -> tuple[float, int, int]:
+    return (
+        float(hit.confidence or 0.0),
+        min(int(hit.width or 0), int(hit.height or 0)),
+        max(int(hit.width or 0), int(hit.height or 0)),
+    )
+
+
+def evaluate_hit_rejection_reason(second: float, hit: DetectionHit) -> Optional[str]:
+    if hit.angle != 0 and second > 1.0 and min(hit.width, hit.height) < LARGE_FACE_SIDE:
+        return "late_rotated_small"
+    if (
+        second > 1.0
+        and min(hit.width, hit.height) < LARGE_FACE_SIDE
+        and float(hit.confidence or 0.0) < 0.75
+    ):
+        return "late_small_low_conf"
+    if (
+        second > 1.0
+        and hit.angle == 0
+        and float(hit.confidence or 0.0) < LATE_FACE_MIN_CONFIDENCE
+        and float(hit.vertical_ratio or 0.0) > LATE_MASK_VERTICAL_RATIO
+    ):
+        return "late_front_low_conf_tall"
+    if (
+        second > 1.0
+        and hit.angle == 0
+        and float(hit.mouth_eye_ratio or 0.0) > LATE_MASK_MOUTH_EYE_RATIO
+        and float(hit.mouth_offset_ratio or 0.0) > LATE_MASK_MOUTH_OFFSET_RATIO
+    ):
+        return "late_front_wide_mouth_offcenter"
+    if (
+        second > 1.0
+        and hit.angle == 0
+        and float(hit.mouth_eye_ratio or 0.0) > LATE_MASK_STRICT_MOUTH_EYE_RATIO
+        and (
+            float(hit.mouth_offset_ratio or 0.0) < LATE_MASK_CENTERED_MOUTH_OFFSET_RATIO
+            or float(hit.mouth_offset_ratio or 0.0) > LATE_MASK_MOUTH_OFFSET_RATIO
+        )
+    ):
+        return "late_front_very_wide_mouth"
+    if (
+        second > 1.0
+        and hit.angle != 0
+        and float(hit.nose_offset_ratio or 0.0) > LATE_ROTATED_NOSE_OFFSET_RATIO
+        and float(hit.mouth_eye_ratio or 0.0) > LATE_ROTATED_MOUTH_EYE_RATIO
+    ):
+        return "late_rotated_nose_offset_wide_mouth"
+    if (
+        second > 1.0
+        and hit.angle != 0
+        and float(hit.confidence or 0.0) < LATE_FACE_MIN_CONFIDENCE
+        and float(hit.mouth_eye_ratio or 0.0) > LATE_ROTATED_STRICT_MOUTH_EYE_RATIO
+    ):
+        return "late_rotated_low_conf_very_wide_mouth"
+    return None
 
 
 def read_frame_at_second(capture: cv2.VideoCapture, second: float, fps: float, frame_count: int):
@@ -605,6 +836,9 @@ def scan_video_for_face(
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
         checked_frames = 0
         pending_weak_hit: Optional[tuple[float, DetectionHit]] = None
+        best_debug_hit: Optional[DetectionHit] = None
+        best_debug_second: Optional[float] = None
+        best_debug_reason: Optional[str] = None
         for second, frame in iter_sampled_frames(capture, fps, interval_seconds):
             checked_frames += 1
             try:
@@ -614,51 +848,13 @@ def scan_video_for_face(
             if hit is None:
                 continue
 
-            if hit.angle != 0 and second > 1.0 and min(hit.width, hit.height) < LARGE_FACE_SIDE:
-                continue
-            if (
-                second > 1.0
-                and min(hit.width, hit.height) < LARGE_FACE_SIDE
-                and float(hit.confidence or 0.0) < 0.75
-            ):
-                continue
-            if (
-                second > 1.0
-                and hit.angle == 0
-                and float(hit.confidence or 0.0) < LATE_FACE_MIN_CONFIDENCE
-                and float(hit.vertical_ratio or 0.0) > LATE_MASK_VERTICAL_RATIO
-            ):
-                continue
-            if (
-                second > 1.0
-                and hit.angle == 0
-                and float(hit.mouth_eye_ratio or 0.0) > LATE_MASK_MOUTH_EYE_RATIO
-                and float(hit.mouth_offset_ratio or 0.0) > LATE_MASK_MOUTH_OFFSET_RATIO
-            ):
-                continue
-            if (
-                second > 1.0
-                and hit.angle == 0
-                and float(hit.mouth_eye_ratio or 0.0) > LATE_MASK_STRICT_MOUTH_EYE_RATIO
-                and (
-                    float(hit.mouth_offset_ratio or 0.0) < LATE_MASK_CENTERED_MOUTH_OFFSET_RATIO
-                    or float(hit.mouth_offset_ratio or 0.0) > LATE_MASK_MOUTH_OFFSET_RATIO
-                )
-            ):
-                continue
-            if (
-                second > 1.0
-                and hit.angle != 0
-                and float(hit.nose_offset_ratio or 0.0) > LATE_ROTATED_NOSE_OFFSET_RATIO
-                and float(hit.mouth_eye_ratio or 0.0) > LATE_ROTATED_MOUTH_EYE_RATIO
-            ):
-                continue
-            if (
-                second > 1.0
-                and hit.angle != 0
-                and float(hit.confidence or 0.0) < LATE_FACE_MIN_CONFIDENCE
-                and float(hit.mouth_eye_ratio or 0.0) > LATE_ROTATED_STRICT_MOUTH_EYE_RATIO
-            ):
+            rejection_reason = evaluate_hit_rejection_reason(second, hit)
+            if best_debug_hit is None or hit_debug_score(hit) > hit_debug_score(best_debug_hit):
+                best_debug_hit = hit
+                best_debug_second = second
+                best_debug_reason = rejection_reason or "accepted"
+
+            if rejection_reason is not None:
                 continue
 
             if hit.requires_confirmation:
@@ -674,6 +870,10 @@ def scan_video_for_face(
                             checked_frames=checked_frames,
                             matched_second=second,
                             matched_detector=f"{hit.label}-confirmed",
+                            result_source="scan",
+                            debug_hit=hit,
+                            debug_hit_second=second,
+                            debug_hit_reason="accepted-confirmed",
                         )
 
                 pending_weak_hit = (second, hit)
@@ -686,6 +886,10 @@ def scan_video_for_face(
                     checked_frames=checked_frames,
                     matched_second=second,
                     matched_detector=hit.label,
+                    result_source="scan",
+                    debug_hit=hit,
+                    debug_hit_second=second,
+                    debug_hit_reason="accepted",
                 )
 
         return VideoScanResult(
@@ -693,6 +897,10 @@ def scan_video_for_face(
             has_face=False,
             checked_frames=checked_frames,
             error="無法讀出任何有效畫面" if checked_frames == 0 else None,
+            result_source="scan",
+            debug_hit=best_debug_hit,
+            debug_hit_second=best_debug_second,
+            debug_hit_reason=best_debug_reason,
         )
     finally:
         capture.release()
@@ -726,7 +934,9 @@ def run_scan(args: argparse.Namespace) -> int:
     recursive = not args.top_only
     root_dir = target_path if target_path.is_dir() else target_path.parent
     destination_dir = root_dir / NO_FACE_FOLDER_NAME
+    log_path = build_scan_log_path(root_dir)
     overrides = load_label_overrides()
+    scan_cache = {} if args.rescan else load_scan_log_cache(log_path)
 
     videos = list(iter_videos(target_path, recursive=recursive))
     if args.limit is not None:
@@ -757,41 +967,52 @@ def run_scan(args: argparse.Namespace) -> int:
     print(f"影片數量：{len(videos)}")
     print(f"抽幀間隔：{args.interval} 秒")
     print(f"目的資料夾：{destination_dir}")
+    print(f"log 檔：{log_path}")
     if args.dry_run:
         print("目前是 dry-run，只會顯示結果，不會搬檔。")
     if use_overrides:
         print(f"已載入案例覆寫：有人臉={len(overrides.known_face_files)} | 無人臉={len(overrides.known_no_face_files)}")
     else:
         print("已忽略案例覆寫，全部改用實際偵測。")
+    if args.rescan:
+        print("已忽略既有 log 快取，全部重跑。")
+    else:
+        print(f"已載入快取紀錄：{len(scan_cache)} 筆")
     print("")
 
     for index, video_path in enumerate(videos, start=1):
+        signature = build_video_signature(video_path, root_dir)
         override_value = overrides.classify(video_path.name) if use_overrides else None
-        if override_value is None:
+        cache_key = str((signature or {}).get("cache_key") or "")
+        if override_value is not None:
+            result = VideoScanResult(
+                video_path=video_path,
+                has_face=override_value,
+                checked_frames=0,
+                matched_detector="OverrideCase" if override_value else None,
+                result_source="override",
+            )
+        elif not args.rescan and cache_key and cache_key in scan_cache:
+            result = result_from_log_entry(scan_cache[cache_key], video_path)
+        else:
             if detector is None:
                 result = VideoScanResult(
                     video_path=video_path,
                     has_face=False,
                     checked_frames=0,
                     error="偵測器未初始化",
+                    result_source="scan",
                 )
             else:
                 result = scan_video_for_face(video_path, detector, args.interval)
                 gc.collect()
-        else:
-            result = VideoScanResult(
-                video_path=video_path,
-                has_face=override_value,
-                checked_frames=0,
-                matched_detector="OverrideCase" if override_value else None,
-            )
 
+        action = "error"
         if result.error:
             error_count += 1
-            print(f"[{index}/{len(videos)}] 錯誤 | {video_path.name} | {result.error}")
-            continue
-
-        if result.has_face:
+            source_label = "快取錯誤" if result.result_source == "cache" else "錯誤"
+            print(f"[{index}/{len(videos)}] {source_label} | {video_path.name} | {result.error}")
+        elif result.has_face:
             kept_count += 1
             second_text = (
                 f"{result.matched_second:.1f}s"
@@ -799,21 +1020,45 @@ def run_scan(args: argparse.Namespace) -> int:
                 else "unknown"
             )
             detector_text = result.matched_detector or "unknown"
+            if result.result_source == "cache":
+                status_text = "快取保留"
+            elif result.result_source == "override":
+                status_text = "覆寫保留"
+            else:
+                status_text = "保留"
             print(
-                f"[{index}/{len(videos)}] 保留 | {video_path.name} | "
+                f"[{index}/{len(videos)}] {status_text} | {video_path.name} | "
                 f"check={result.checked_frames} | hit={second_text} | detector={detector_text}"
             )
-            continue
+            action = "keep"
+        else:
+            moved_path = move_to_no_face_folder(video_path, destination_dir, args.dry_run)
+            result.moved_to = moved_path
+            moved_count += 1
+            moved_label = moved_path if moved_path is not None else destination_dir
+            if result.result_source == "cache":
+                status_text = "快取預計搬移" if args.dry_run else "快取已搬移"
+            elif result.result_source == "override":
+                status_text = "覆寫預計搬移" if args.dry_run else "覆寫已搬移"
+            else:
+                status_text = "預計搬移" if args.dry_run else "已搬移"
+            print(
+                f"[{index}/{len(videos)}] {status_text} | {video_path.name} | "
+                f"check={result.checked_frames} | -> {moved_label}"
+            )
+            action = "move"
 
-        moved_path = move_to_no_face_folder(video_path, destination_dir, args.dry_run)
-        result.moved_to = moved_path
-        moved_count += 1
-        moved_label = moved_path if moved_path is not None else destination_dir
-        status_text = "預計搬移" if args.dry_run else "已搬移"
-        print(
-            f"[{index}/{len(videos)}] {status_text} | {video_path.name} | "
-            f"check={result.checked_frames} | -> {moved_label}"
+        entry = build_scan_log_entry(
+            video_path=video_path,
+            root_dir=root_dir,
+            result=result,
+            signature=signature,
+            action=action,
+            dry_run=args.dry_run,
         )
+        append_scan_log_entry(log_path, entry)
+        if cache_key and not result.error:
+            scan_cache[cache_key] = entry
 
     print("")
     print(
