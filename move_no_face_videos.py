@@ -59,6 +59,21 @@ LATE_MASK_STRICT_MOUTH_EYE_RATIO = 0.93
 LATE_ROTATED_NOSE_OFFSET_RATIO = 0.33
 LATE_ROTATED_MOUTH_EYE_RATIO = 0.88
 LATE_ROTATED_STRICT_MOUTH_EYE_RATIO = 0.92
+EARLY_ROTATED_MIN_FACE_SIDE = 150
+EARLY_ROTATED_MAX_MOUTH_EYE_RATIO = 0.98
+EARLY_ROTATED_MIN_EYE_ANGLE = 1.0
+EARLY_FRONT_LOW_SKIN_RATIO = 0.45
+EARLY_FRONT_LOW_CONFIDENCE = 0.80
+ANYTIME_FRONT_TALL_REJECT_CONFIDENCE = 0.75
+ANYTIME_FRONT_TALL_REJECT_RATIO = 1.28
+LATE_ROTATED_SMALL_RESCUE_MIN_SIDE = 120
+LATE_ROTATED_SMALL_RESCUE_HIGH_CONFIDENCE = 0.90
+LATE_ROTATED_SMALL_RESCUE_NORMAL_MIN_SIDE = 155
+LATE_ROTATED_SMALL_RESCUE_MAX_VERTICAL_RATIO = 1.12
+LATE_ROTATED_SMALL_RESCUE_MAX_MOUTH_EYE_RATIO = 0.96
+LATE_ROTATED_SMALL_RESCUE_MAX_NOSE_OFFSET_RATIO = 0.18
+LATE_ROTATED_CENTERED_MAX_OFFSET_RATIO = 0.03
+LATE_FRONT_WIDE_ASPECT_RATIO = 1.40
 OVERRIDES_PATH = Path(__file__).with_name("move_no_face_videos_overrides.json")
 SCAN_LOG_FILE_NAME = "face_scan_log.jsonl"
 
@@ -682,11 +697,47 @@ def hit_debug_score(hit: DetectionHit) -> tuple[float, int, int]:
 
 
 def evaluate_hit_rejection_reason(second: float, hit: DetectionHit) -> Optional[str]:
-    if hit.angle != 0 and second > 1.0 and min(hit.width, hit.height) < LARGE_FACE_SIDE:
+    min_side = min(hit.width, hit.height)
+    max_side = max(hit.width, hit.height)
+    aspect_ratio = float(max_side) / float(max(min_side, 1))
+
+    if hit.angle != 0 and second <= 1.0:
+        if min_side < EARLY_ROTATED_MIN_FACE_SIDE:
+            return "early_rotated_small"
+        if float(hit.mouth_eye_ratio or 0.0) > EARLY_ROTATED_MAX_MOUTH_EYE_RATIO:
+            return "early_rotated_extreme_mouth_width"
+        if float(hit.eye_angle or 0.0) <= EARLY_ROTATED_MIN_EYE_ANGLE:
+            return "early_rotated_flat_eye_line"
+    if (
+        hit.angle == 0
+        and second <= 1.0
+        and float(hit.confidence or 0.0) < EARLY_FRONT_LOW_CONFIDENCE
+        and float(hit.lower_skin_ratio or 0.0) < EARLY_FRONT_LOW_SKIN_RATIO
+    ):
+        return "early_front_low_skin_low_conf"
+    if (
+        hit.angle == 0
+        and float(hit.confidence or 0.0) < ANYTIME_FRONT_TALL_REJECT_CONFIDENCE
+        and float(hit.vertical_ratio or 0.0) > ANYTIME_FRONT_TALL_REJECT_RATIO
+    ):
+        return "front_low_conf_tall"
+    if hit.angle != 0 and second > 1.0 and min_side < LARGE_FACE_SIDE:
+        if (
+            min_side >= LATE_ROTATED_SMALL_RESCUE_MIN_SIDE
+            and float(hit.confidence or 0.0) >= LATE_ROTATED_SMALL_RESCUE_HIGH_CONFIDENCE
+        ):
+            return None
+        if (
+            min_side >= LATE_ROTATED_SMALL_RESCUE_NORMAL_MIN_SIDE
+            and float(hit.vertical_ratio or 0.0) <= LATE_ROTATED_SMALL_RESCUE_MAX_VERTICAL_RATIO
+            and float(hit.mouth_eye_ratio or 0.0) <= LATE_ROTATED_SMALL_RESCUE_MAX_MOUTH_EYE_RATIO
+            and float(hit.nose_offset_ratio or 0.0) <= LATE_ROTATED_SMALL_RESCUE_MAX_NOSE_OFFSET_RATIO
+        ):
+            return None
         return "late_rotated_small"
     if (
         second > 1.0
-        and min(hit.width, hit.height) < LARGE_FACE_SIDE
+        and min_side < LARGE_FACE_SIDE
         and float(hit.confidence or 0.0) < 0.75
     ):
         return "late_small_low_conf"
@@ -728,6 +779,38 @@ def evaluate_hit_rejection_reason(second: float, hit: DetectionHit) -> Optional[
         and float(hit.mouth_eye_ratio or 0.0) > LATE_ROTATED_STRICT_MOUTH_EYE_RATIO
     ):
         return "late_rotated_low_conf_very_wide_mouth"
+    if (
+        second > 1.0
+        and hit.angle != 0
+        and min_side >= LARGE_FACE_SIDE
+        and float(hit.nose_offset_ratio or 0.0) < LATE_ROTATED_CENTERED_MAX_OFFSET_RATIO
+        and float(hit.mouth_offset_ratio or 0.0) < LATE_ROTATED_CENTERED_MAX_OFFSET_RATIO
+    ):
+        return "late_rotated_overly_centered_large_face"
+    if (
+        second > 1.0
+        and hit.angle == 0
+        and float(hit.confidence or 0.0) < LATE_FACE_MIN_CONFIDENCE
+        and aspect_ratio > LATE_FRONT_WIDE_ASPECT_RATIO
+        and float(hit.mouth_offset_ratio or 0.0) > 0.28
+    ):
+        return "late_front_wide_box_offcenter"
+    if (
+        second > 1.0
+        and hit.angle == 0
+        and min_side >= 250
+        and float(hit.lower_skin_ratio or 0.0) < 0.5
+        and float(hit.mouth_offset_ratio or 0.0) < 0.02
+        and float(hit.vertical_ratio or 0.0) > 1.30
+    ):
+        return "late_front_low_skin_tall_centered"
+    if (
+        second > 1.0
+        and hit.angle != 0
+        and float(hit.confidence or 0.0) < 0.70
+        and float(hit.nose_offset_ratio or 0.0) > 0.40
+    ):
+        return "late_rotated_low_conf_high_nose_offset"
     return None
 
 
@@ -763,6 +846,27 @@ def build_sample_seconds(duration_seconds: float, interval_seconds: float) -> li
         sample_seconds.append(last_second)
 
     return sample_seconds
+
+
+def build_tail_probe_seconds(fps: float, frame_count: int) -> list[float]:
+    if fps <= 0 or frame_count <= 0:
+        return []
+
+    duration_seconds = float(frame_count) / float(fps)
+    candidates = [
+        max(duration_seconds - 1.0, 0.0),
+        max(duration_seconds - 0.5, 0.0),
+        max(duration_seconds - 0.1, 0.0),
+        max((frame_count - 1) / float(fps), 0.0),
+    ]
+
+    seconds: list[float] = []
+    for second in candidates:
+        second = round(second, 3)
+        if any(abs(existing - second) < 0.08 for existing in seconds):
+            continue
+        seconds.append(second)
+    return seconds
 
 
 def iter_sampled_frames(
@@ -834,6 +938,7 @@ def scan_video_for_face(
 
     try:
         fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         checked_frames = 0
         pending_weak_hit: Optional[tuple[float, DetectionHit]] = None
         best_debug_hit: Optional[DetectionHit] = None
@@ -891,6 +996,45 @@ def scan_video_for_face(
                     debug_hit_second=second,
                     debug_hit_reason="accepted",
                 )
+
+        tail_probe_seconds = build_tail_probe_seconds(fps, frame_count)
+        if tail_probe_seconds:
+            tail_capture = cv2.VideoCapture(str(video_path))
+            try:
+                if tail_capture.isOpened():
+                    for second in tail_probe_seconds:
+                        success, frame = read_frame_at_second(tail_capture, second, fps, frame_count)
+                        if not success or frame is None:
+                            continue
+                        try:
+                            hit = detector.frame_has_face(frame)
+                        except Exception:
+                            continue
+                        if hit is None:
+                            continue
+
+                        rejection_reason = evaluate_hit_rejection_reason(second, hit)
+                        if best_debug_hit is None or hit_debug_score(hit) > hit_debug_score(best_debug_hit):
+                            best_debug_hit = hit
+                            best_debug_second = second
+                            best_debug_reason = rejection_reason or "accepted-tail"
+
+                        if rejection_reason is not None:
+                            continue
+
+                        return VideoScanResult(
+                            video_path=video_path,
+                            has_face=True,
+                            checked_frames=checked_frames,
+                            matched_second=second,
+                            matched_detector=hit.label,
+                            result_source="scan",
+                            debug_hit=hit,
+                            debug_hit_second=second,
+                            debug_hit_reason="accepted-tail",
+                        )
+            finally:
+                tail_capture.release()
 
         return VideoScanResult(
             video_path=video_path,
