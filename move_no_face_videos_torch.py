@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import json
 import math
@@ -9,10 +10,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
+
+if os.name == "nt":
+    from ctypes import wintypes
 
 import numpy as np
 
@@ -44,6 +50,11 @@ ROTATION_ANGLES = (0, 90, 270)
 MAX_SAMPLED_FRAMES_PER_VIDEO = 1800
 MAX_CONSECUTIVE_READ_FAILURES = 12
 GPU_DETECTION_BATCH_SIZE = 8
+WORKER_WATCHDOG_POLL_SECONDS = 5.0
+WORKER_WATCHDOG_TIMEOUT_SECONDS = 90.0
+WORKER_WATCHDOG_IDLE_POLLS = 3
+WORKER_WATCHDOG_CPU_EPSILON_SECONDS = 0.05
+WORKER_WATCHDOG_GPU_IDLE_THRESHOLD = 1
 MIN_FACE_SIDE = 120
 LARGE_FACE_SIDE = 300
 MIN_LOWER_FACE_SKIN_RATIO = 0.30
@@ -79,6 +90,203 @@ LATE_ROTATED_CENTERED_MAX_OFFSET_RATIO = 0.03
 LATE_FRONT_WIDE_ASPECT_RATIO = 1.40
 OVERRIDES_PATH = Path(__file__).with_name("move_no_face_videos_overrides.json")
 SCAN_LOG_FILE_NAME = "face_scan_log.jsonl"
+
+
+if os.name == "nt":
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _TH32CS_SNAPPROCESS = 0x00000002
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _OPEN_PROCESS = ctypes.windll.kernel32.OpenProcess
+    _OPEN_PROCESS.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _OPEN_PROCESS.restype = wintypes.HANDLE
+    _CLOSE_HANDLE = ctypes.windll.kernel32.CloseHandle
+    _CLOSE_HANDLE.argtypes = [wintypes.HANDLE]
+    _CLOSE_HANDLE.restype = wintypes.BOOL
+    _CREATE_TOOLHELP32_SNAPSHOT = ctypes.windll.kernel32.CreateToolhelp32Snapshot
+    _CREATE_TOOLHELP32_SNAPSHOT.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _CREATE_TOOLHELP32_SNAPSHOT.restype = wintypes.HANDLE
+    _PROCESS32_FIRST = ctypes.windll.kernel32.Process32FirstW
+    _PROCESS32_FIRST.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _PROCESS32_FIRST.restype = wintypes.BOOL
+    _PROCESS32_NEXT = ctypes.windll.kernel32.Process32NextW
+    _PROCESS32_NEXT.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _PROCESS32_NEXT.restype = wintypes.BOOL
+    _GET_PROCESS_TIMES = ctypes.windll.kernel32.GetProcessTimes
+    _GET_PROCESS_TIMES.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+    ]
+    _GET_PROCESS_TIMES.restype = wintypes.BOOL
+
+
+def _filetime_to_seconds(filetime) -> float:
+    value = (int(filetime.dwHighDateTime) << 32) | int(filetime.dwLowDateTime)
+    return float(value) / 10_000_000.0
+
+
+def get_process_cpu_seconds_by_pid(pid: int) -> Optional[float]:
+    if os.name != "nt" or not pid or pid <= 0:
+        return None
+
+    try:
+        handle = _OPEN_PROCESS(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    except Exception:
+        return None
+    if not handle:
+        return None
+
+    creation_time = _FILETIME()
+    exit_time = _FILETIME()
+    kernel_time = _FILETIME()
+    user_time = _FILETIME()
+    try:
+        success = bool(
+            _GET_PROCESS_TIMES(
+                handle,
+                ctypes.byref(creation_time),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel_time),
+                ctypes.byref(user_time),
+            )
+        )
+    except Exception:
+        _CLOSE_HANDLE(handle)
+        return None
+
+    _CLOSE_HANDLE(handle)
+    if not success:
+        return None
+    return _filetime_to_seconds(kernel_time) + _filetime_to_seconds(user_time)
+
+
+def get_descendant_pids(root_pid: int) -> list[int]:
+    if os.name != "nt" or not root_pid or root_pid <= 0:
+        return []
+
+    try:
+        snapshot = _CREATE_TOOLHELP32_SNAPSHOT(_TH32CS_SNAPPROCESS, 0)
+    except Exception:
+        return []
+    if snapshot == _INVALID_HANDLE_VALUE:
+        return []
+
+    parent_map: dict[int, list[int]] = {}
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        has_item = bool(_PROCESS32_FIRST(snapshot, ctypes.byref(entry)))
+        while has_item:
+            parent_map.setdefault(int(entry.th32ParentProcessID), []).append(int(entry.th32ProcessID))
+            has_item = bool(_PROCESS32_NEXT(snapshot, ctypes.byref(entry)))
+    finally:
+        _CLOSE_HANDLE(snapshot)
+
+    descendants: list[int] = []
+    stack = list(parent_map.get(int(root_pid), []))
+    seen = set()
+    while stack:
+        pid = int(stack.pop())
+        if pid <= 0 or pid in seen:
+            continue
+        seen.add(pid)
+        descendants.append(pid)
+        stack.extend(parent_map.get(pid, []))
+    return descendants
+
+
+def get_process_tree_pids(process: Optional[subprocess.Popen]) -> list[int]:
+    if process is None:
+        return []
+    root_pid = int(getattr(process, "pid", 0) or 0)
+    if root_pid <= 0:
+        return []
+    return [root_pid, *get_descendant_pids(root_pid)]
+
+
+def get_process_tree_cpu_seconds(process: Optional[subprocess.Popen]) -> Optional[float]:
+    pids = get_process_tree_pids(process)
+    if not pids:
+        return None
+
+    cpu_values = [get_process_cpu_seconds_by_pid(pid) for pid in pids]
+    numeric_values = [value for value in cpu_values if value is not None]
+    if not numeric_values:
+        return None
+    return float(sum(numeric_values))
+
+
+def query_gpu_activity_for_pids(pids: list[int]) -> Optional[bool]:
+    pid_set = {int(pid) for pid in pids if int(pid) > 0}
+    if not pid_set:
+        return None
+
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "pmon",
+                "-c",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    for line in completed.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.split()
+        if len(parts) < 9:
+            continue
+        try:
+            pid = int(parts[1])
+        except ValueError:
+            continue
+        if pid not in pid_set:
+            continue
+
+        for value_text in parts[3:9]:
+            if value_text == "-":
+                continue
+            try:
+                if float(value_text) > WORKER_WATCHDOG_GPU_IDLE_THRESHOLD:
+                    return True
+            except ValueError:
+                continue
+
+    return False
 
 
 try:
@@ -1279,9 +1487,10 @@ def format_exit_code(returncode: int) -> str:
 
 
 class PersistentScanWorker:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, *, enable_gpu_watchdog: bool = False) -> None:
         self.args = args
         self.process: Optional[subprocess.Popen] = None
+        self.enable_gpu_watchdog = bool(enable_gpu_watchdog)
 
     def _build_command(self) -> list[str]:
         command = [
@@ -1314,6 +1523,35 @@ class PersistentScanWorker:
             bufsize=1,
         )
 
+    def _kill_process_tree(self, process: Optional[subprocess.Popen] = None) -> None:
+        target_process = process or self.process
+        if target_process is None:
+            return
+
+        pid = int(target_process.pid or 0)
+        if pid <= 0:
+            return
+
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                    check=False,
+                )
+                return
+            except Exception:
+                pass
+
+        try:
+            target_process.kill()
+        except Exception:
+            pass
+
     def _crash_result(self, video_path: Path) -> VideoScanResult:
         stderr_output = ""
         exit_code = "unknown"
@@ -1339,9 +1577,118 @@ class PersistentScanWorker:
             result_source="scan",
         )
 
+    def _kill_result(self, video_path: Path, reason_text: str) -> VideoScanResult:
+        stderr_output = ""
+        if self.process is not None:
+            process = self.process
+            try:
+                if process.poll() is None:
+                    self._kill_process_tree(process)
+                    process.wait(timeout=5)
+            except Exception:
+                pass
+            if process.stderr is not None:
+                try:
+                    stderr_output = process.stderr.read()
+                except Exception:
+                    stderr_output = ""
+        self.close()
+        summary = summarize_child_output(stderr_output)
+        error_text = reason_text
+        if summary:
+            error_text = f"{error_text} | {summary}"
+        return VideoScanResult(
+            video_path=video_path,
+            has_face=False,
+            checked_frames=0,
+            error=error_text,
+            result_source="scan",
+        )
+
+    def _wait_for_response(self, video_path: Path) -> tuple[Optional[str], Optional[VideoScanResult]]:
+        if self.process is None or self.process.stdout is None:
+            return None, VideoScanResult(
+                video_path=video_path,
+                has_face=False,
+                checked_frames=0,
+                error="子程序輸出不可用",
+                result_source="scan",
+            )
+
+        reader_state: dict[str, object] = {"line": None, "error": None}
+
+        def read_line() -> None:
+            try:
+                reader_state["line"] = self.process.stdout.readline()
+            except BaseException as exc:
+                reader_state["error"] = exc
+
+        reader_thread = threading.Thread(target=read_line, daemon=True)
+        reader_thread.start()
+
+        start_time = time.monotonic()
+        last_cpu_seconds = get_process_tree_cpu_seconds(self.process)
+        idle_polls = 0
+
+        while reader_thread.is_alive():
+            reader_thread.join(timeout=WORKER_WATCHDOG_POLL_SECONDS)
+            if not reader_thread.is_alive():
+                break
+            if self.process is None:
+                break
+            if self.process.poll() is not None:
+                return None, self._crash_result(video_path)
+
+            elapsed = time.monotonic() - start_time
+            monitored_pids = get_process_tree_pids(self.process)
+            current_cpu_seconds = get_process_tree_cpu_seconds(self.process)
+            cpu_active = False
+            if current_cpu_seconds is not None and last_cpu_seconds is not None:
+                cpu_active = (
+                    current_cpu_seconds - last_cpu_seconds
+                    > WORKER_WATCHDOG_CPU_EPSILON_SECONDS
+                )
+            if current_cpu_seconds is not None:
+                last_cpu_seconds = current_cpu_seconds
+
+            if elapsed < WORKER_WATCHDOG_TIMEOUT_SECONDS:
+                continue
+
+            if not self.enable_gpu_watchdog:
+                continue
+
+            gpu_active = query_gpu_activity_for_pids(monitored_pids)
+            if gpu_active is False and not cpu_active:
+                idle_polls += 1
+            elif gpu_active is True or cpu_active:
+                idle_polls = 0
+            else:
+                idle_polls = 0
+
+            if idle_polls >= WORKER_WATCHDOG_IDLE_POLLS:
+                timeout_text = (
+                    "子程序疑似卡死 | "
+                    f"timeout={int(elapsed)}s | "
+                    f"gpu_idle_polls={idle_polls} | "
+                    f"pids={','.join(str(pid) for pid in monitored_pids)}"
+                )
+                return None, self._kill_result(video_path, timeout_text)
+
+        reader_thread.join(timeout=1)
+        if reader_state["error"] is not None:
+            return None, VideoScanResult(
+                video_path=video_path,
+                has_face=False,
+                checked_frames=0,
+                error=f"子程序通訊失敗 | {reader_state['error']}",
+                result_source="scan",
+            )
+
+        return str(reader_state["line"] or ""), None
+
     def scan(self, video_path: Path) -> VideoScanResult:
         last_error: Optional[VideoScanResult] = None
-        for _ in range(2):
+        for attempt_index in range(2):
             self._ensure_started()
             if self.process is None or self.process.stdin is None or self.process.stdout is None:
                 return VideoScanResult(
@@ -1356,7 +1703,6 @@ class PersistentScanWorker:
                 request = json.dumps({"video_path": str(video_path)}, ensure_ascii=False)
                 self.process.stdin.write(request + "\n")
                 self.process.stdin.flush()
-                response_line = self.process.stdout.readline()
             except Exception as exc:
                 last_error = VideoScanResult(
                     video_path=video_path,
@@ -1367,6 +1713,13 @@ class PersistentScanWorker:
                 )
                 self.close()
                 continue
+
+            response_line, wait_error = self._wait_for_response(video_path)
+            if wait_error is not None:
+                last_error = wait_error
+                if attempt_index == 0:
+                    continue
+                break
 
             if not response_line:
                 last_error = self._crash_result(video_path)
@@ -1391,6 +1744,14 @@ class PersistentScanWorker:
             result.video_path = video_path
             return result
 
+        if (
+            last_error is not None
+            and last_error.error is not None
+            and "子程序疑似卡死" in last_error.error
+            and "已重試 1 次仍失敗" not in last_error.error
+        ):
+            last_error.error = f"{last_error.error} | 已重試 1 次仍失敗"
+
         return last_error or VideoScanResult(
             video_path=video_path,
             has_face=False,
@@ -1411,10 +1772,11 @@ class PersistentScanWorker:
                 except Exception:
                     pass
             if process.poll() is None:
-                process.wait(timeout=1)
+                self._kill_process_tree(process)
+                process.wait(timeout=5)
         except Exception:
             try:
-                process.kill()
+                self._kill_process_tree(process)
             except Exception:
                 pass
         finally:
@@ -1645,12 +2007,16 @@ def run_scan(args: argparse.Namespace) -> int:
     if device_selection is not None:
         print(f"偵測裝置：{device_selection.description}")
         print(
-            "掃描模式：長駐子程序重複使用模型；若單支影片讓子程序崩潰，"
-            "會自動重開後繼續下一支。"
+            "掃描模式：長駐子程序重複使用模型；若單支影片讓子程序崩潰或疑似卡死，"
+            "會先自動重跑一次，仍失敗就記錯誤並繼續下一支。"
         )
     print("")
 
-    worker = PersistentScanWorker(args) if device_selection is not None else None
+    worker = (
+        PersistentScanWorker(args, enable_gpu_watchdog=device_selection.used_gpu)
+        if device_selection is not None
+        else None
+    )
     for index, video_path in enumerate(videos, start=1):
         signature = build_video_signature(video_path, root_dir)
         override_value = overrides.classify(video_path.name) if use_overrides else None
