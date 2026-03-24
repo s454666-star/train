@@ -391,10 +391,23 @@ class FaceExtractorApp:
         original_ext = os.path.splitext(original_video_path)[1].lower() or ".mp4"
         return self.sanitize_filename(f"{output_base_name}{original_ext}")
 
+    def normalize_db_relative_path(self, path: str) -> str:
+        normalized = str(path or "").strip().replace("\\", "/")
+        normalized = re.sub(r"/+", "/", normalized)
+        return normalized.strip("/")
+
+    def build_db_directory_path(self, relative_path: str) -> Optional[str]:
+        normalized = self.normalize_db_relative_path(relative_path)
+        if not normalized or "/" not in normalized:
+            return None
+
+        directory = normalized.rsplit("/", 1)[0].strip("/")
+        return directory or None
+
     def build_db_relative_path(self, output_dir: str, filename: str) -> str:
         folder_name = self.sanitize_filename(os.path.basename(os.path.abspath(output_dir)))
         safe_filename = self.sanitize_filename(os.path.basename(filename))
-        return f"\\{folder_name}\\{safe_filename}"
+        return self.normalize_db_relative_path(f"{folder_name}/{safe_filename}")
 
     def build_feature_capture_plan(self, duration: float) -> List[Dict[str, Any]]:
         duration = max(float(duration or 0.0), 0.0)
@@ -668,7 +681,8 @@ class FaceExtractorApp:
 
         for screenshot_id, screenshot_path in rows:
             if screenshot_path:
-                screenshot_abs_path = os.path.abspath(os.path.join(r"D:\video", str(screenshot_path).lstrip("\\/").replace("\\", os.sep)))
+                normalized_screenshot_path = self.normalize_db_relative_path(str(screenshot_path)).replace("/", os.sep)
+                screenshot_abs_path = os.path.abspath(os.path.join(r"D:\video", normalized_screenshot_path))
                 if os.path.exists(screenshot_abs_path):
                     try:
                         os.remove(screenshot_abs_path)
@@ -684,8 +698,9 @@ class FaceExtractorApp:
         if not self.db_cursor or not video_master_id:
             return
 
-        directory_path = os.path.dirname(relative_video_path.lstrip("\\/")).replace("/", "\\").strip("\\")
-        file_name = os.path.basename(relative_video_path.replace("\\", os.sep))
+        relative_video_path = self.normalize_db_relative_path(relative_video_path)
+        directory_path = self.build_db_directory_path(relative_video_path)
+        file_name = os.path.basename(relative_video_path.replace("/", os.sep))
         path_sha1 = hashlib.sha1(relative_video_path.lower().encode("utf-8")).hexdigest()
 
         sql = """
@@ -776,7 +791,7 @@ class FaceExtractorApp:
 
             self.clear_existing_video_features(video_master_id)
 
-            directory_path = os.path.dirname(relative_video_path.lstrip("\\/")).replace("/", "\\").strip("\\")
+            directory_path = self.build_db_directory_path(relative_video_path)
             file_name = os.path.basename(destination_path)
             path_sha1 = hashlib.sha1(relative_video_path.lower().encode("utf-8")).hexdigest()
             file_size_bytes = os.path.getsize(destination_path) if os.path.exists(destination_path) else None
@@ -1290,7 +1305,7 @@ class FaceExtractorApp:
                             INSERT INTO video_master (video_name, video_path, duration, video_type)
                             VALUES (%s, %s, %s, %s)
                         """
-                        relative_video_path = f"\\{os.path.basename(output_dir)}\\{output_video_name}"
+                        relative_video_path = self.build_db_relative_path(output_dir, output_video_name)
                         self.db_cursor.execute(insert_video, (output_video_name, relative_video_path, round(duration, 3), video_type))
                         self.db_connection.commit()
                         video_master_id = self.db_cursor.lastrowid
@@ -1345,7 +1360,7 @@ class FaceExtractorApp:
                                 INSERT INTO video_screenshots (video_master_id, screenshot_path)
                                 VALUES (%s, %s)
                             """
-                            screenshot_db_path = f"\\{os.path.basename(output_dir)}\\{os.path.basename(frame_path)}"
+                            screenshot_db_path = self.build_db_relative_path(output_dir, os.path.basename(frame_path))
                             self.db_cursor.execute(insert_screenshot, (video_master_id, screenshot_db_path))
                             self.db_connection.commit()
                             screenshot_id = self.db_cursor.lastrowid
@@ -1391,7 +1406,7 @@ class FaceExtractorApp:
                                                 INSERT INTO video_face_screenshots (video_screenshot_id, face_image_path)
                                                 VALUES (%s, %s)
                                             """
-                                            face_db_path = f"\\{os.path.basename(output_dir)}\\{os.path.basename(face_path)}"
+                                            face_db_path = self.build_db_relative_path(output_dir, os.path.basename(face_path))
                                             self.db_cursor.execute(insert_face, (screenshot_id, face_db_path))
                                             self.db_connection.commit()
                                             print(f"已插入 video_face_screenshots")
