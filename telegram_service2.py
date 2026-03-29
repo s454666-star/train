@@ -2056,6 +2056,39 @@ async def _delete_messages_in_batches(bot_username: str, message_ids: List[int],
         await asyncio.sleep(0.2)
 
 
+async def _find_remaining_message_ids(peer: Any, message_ids: List[int]) -> List[int]:
+    if not message_ids:
+        return []
+
+    try:
+        fetched = await client.get_messages(peer, ids=message_ids)
+    except Exception:
+        return list(message_ids)
+
+    if fetched is None:
+        return []
+
+    fetched_messages = fetched if isinstance(fetched, list) else [fetched]
+    remaining: List[int] = []
+
+    for msg in fetched_messages:
+        if msg is None:
+            continue
+
+        if type(msg).__name__ == "MessageEmpty":
+            continue
+
+        try:
+            mid = int(getattr(msg, "id", 0) or 0)
+        except Exception:
+            mid = 0
+
+        if mid > 0:
+            remaining.append(mid)
+
+    return sorted(list(set(remaining)))
+
+
 async def _cleanup_chat_after_run(
     bot_username: str,
     min_mid: int = 0,
@@ -2997,6 +3030,28 @@ class UploadBotVideoRequest(BaseModel):
     supports_streaming: bool = True
 
 
+class GetBotFilesRequest(BaseModel):
+    bot_username: str
+    min_message_id: int = 0
+    max_return_files: int = 1000
+    max_raw_payload_bytes: int = 0
+    backfill_limit: int = 360
+    backfill_timeout_seconds: float = 6.0
+    force_backfill: bool = True
+
+
+class ForwardBotMessagesRequest(BaseModel):
+    source_chat_id: int
+    message_ids: List[int]
+    target_bot_username: str
+    bridge_control_text: Optional[str] = None
+
+
+class DeleteMessagesRequest(BaseModel):
+    chat_peer: str
+    message_ids: List[int]
+
+
 @app.post("/bots/send")
 async def send_message_to_bot(payload: SendBotMessageRequest):
     if payload.clear_previous_replies:
@@ -3010,6 +3065,373 @@ async def send_message_to_bot(payload: SendBotMessageRequest):
         sent_message_id = 0
     await backfill_latest_from_bot(payload.bot_username, limit=160, timeout_seconds=6.0, force=True)
     return {"status": "ok", "sent_message_id": sent_message_id}
+
+
+@app.post("/bots/files")
+async def get_bot_files(payload: GetBotFilesRequest):
+    bot_username = str(payload.bot_username or "").strip()
+    if not bot_username:
+        return {
+            "status": "error",
+            "reason": "bot_username_required",
+        }
+
+    connected = await _ensure_client_connected()
+    if not connected:
+        return {
+            "status": "error",
+            "reason": "client_not_connected",
+            "bot_username": bot_username,
+        }
+
+    try:
+        await backfill_latest_from_bot(
+            bot_username,
+            limit=max(int(payload.backfill_limit or 0), 1),
+            timeout_seconds=float(payload.backfill_timeout_seconds or 6.0),
+            force=bool(payload.force_backfill),
+            min_message_id=max(int(payload.min_message_id or 0), 0),
+        )
+
+        files_meta = collect_files_from_store(
+            bot_username,
+            max(int(payload.max_return_files or 0), 1),
+            max(int(payload.max_raw_payload_bytes or 0), 0),
+            min_message_id=max(int(payload.min_message_id or 0), 0),
+        )
+
+        files = list(files_meta.get("files") or [])
+        files_total_bytes = 0
+        source_chat_id = 0
+
+        for file_obj in files:
+            try:
+                files_total_bytes = files_total_bytes + int(file_obj.get("file_size", 0) or 0)
+            except Exception:
+                pass
+
+            if source_chat_id > 0:
+                continue
+
+            try:
+                candidate_chat_id = int(file_obj.get("chat_id", 0) or 0)
+            except Exception:
+                candidate_chat_id = 0
+
+            if candidate_chat_id > 0:
+                source_chat_id = candidate_chat_id
+
+        return {
+            "status": "ok",
+            "bot_username": bot_username,
+            "min_message_id": max(int(payload.min_message_id or 0), 0),
+            "source_chat_id": source_chat_id,
+            "files_total_bytes": files_total_bytes,
+            **files_meta,
+        }
+    except Exception as e:
+        push_log(
+            stage="bots_files",
+            result="files_error",
+            extra={
+                "bot_username": bot_username,
+                "min_message_id": max(int(payload.min_message_id or 0), 0),
+                "error": str(e),
+                "trace": traceback.format_exc()[:1200],
+            },
+        )
+        return {
+            "status": "error",
+            "reason": "files_fetch_failed",
+            "error": str(e),
+            "bot_username": bot_username,
+        }
+
+
+@app.post("/bots/forward-messages")
+async def forward_messages_to_bot(payload: ForwardBotMessagesRequest):
+    source_chat_id = int(payload.source_chat_id or 0)
+    target_bot_username = str(payload.target_bot_username or "").strip()
+    raw_message_ids = list(payload.message_ids or [])
+    bridge_control_text = str(payload.bridge_control_text or "").strip()
+
+    if source_chat_id <= 0:
+        return {
+            "status": "error",
+            "reason": "invalid_source_chat_id",
+        }
+
+    if not target_bot_username:
+        return {
+            "status": "error",
+            "reason": "target_bot_username_required",
+        }
+
+    message_ids: List[int] = []
+    seen_ids = set()
+
+    for raw_mid in raw_message_ids:
+        try:
+            mid = int(raw_mid or 0)
+        except Exception:
+            continue
+
+        if mid <= 0 or mid in seen_ids:
+            continue
+
+        seen_ids.add(mid)
+        message_ids.append(mid)
+
+    if not message_ids:
+        return {
+            "status": "error",
+            "reason": "message_ids_required",
+        }
+
+    connected = await _ensure_client_connected()
+    if not connected:
+        return {
+            "status": "error",
+            "reason": "client_not_connected",
+            "source_chat_id": source_chat_id,
+            "target_bot_username": target_bot_username,
+        }
+
+    try:
+        source_entity = await client.get_input_entity(source_chat_id)
+        target_entity = await client.get_input_entity(target_bot_username)
+        fetched = await client.get_messages(source_entity, ids=message_ids)
+
+        if isinstance(fetched, list):
+            fetched_messages = fetched
+        elif fetched is None:
+            fetched_messages = []
+        else:
+            fetched_messages = [fetched]
+
+        messages_by_id: Dict[int, Message] = {}
+        for msg in fetched_messages:
+            try:
+                mid = int(getattr(msg, "id", 0) or 0)
+            except Exception:
+                mid = 0
+
+            if mid > 0:
+                messages_by_id[mid] = msg
+
+        ordered_messages = [messages_by_id[mid] for mid in message_ids if mid in messages_by_id]
+        missing_message_ids = [mid for mid in message_ids if mid not in messages_by_id]
+        unforwardable_message_ids: List[int] = []
+
+        for msg in ordered_messages:
+            try:
+                mid = int(getattr(msg, "id", 0) or 0)
+            except Exception:
+                mid = 0
+
+            if mid <= 0:
+                continue
+
+            if not getattr(msg, "media", None) or bool(getattr(msg, "noforwards", False)):
+                unforwardable_message_ids.append(mid)
+
+        if not ordered_messages:
+            return {
+                "status": "error",
+                "reason": "source_messages_not_found",
+                "source_chat_id": source_chat_id,
+                "target_bot_username": target_bot_username,
+                "requested_message_ids": message_ids,
+                "missing_message_ids": missing_message_ids,
+            }
+
+        forwardable_messages = [
+            msg for msg in ordered_messages
+            if int(getattr(msg, "id", 0) or 0) not in set(unforwardable_message_ids)
+        ]
+
+        if not forwardable_messages:
+            return {
+                "status": "error",
+                "reason": "no_forwardable_messages",
+                "source_chat_id": source_chat_id,
+                "target_bot_username": target_bot_username,
+                "requested_message_ids": message_ids,
+                "missing_message_ids": missing_message_ids,
+                "unforwardable_message_ids": unforwardable_message_ids,
+            }
+
+        bridge_control_message_id = 0
+        if bridge_control_text:
+            control_message = await client.send_message(target_entity, bridge_control_text, parse_mode=None)
+            try:
+                bridge_control_message_id = int(getattr(control_message, "id", 0) or 0)
+            except Exception:
+                bridge_control_message_id = 0
+
+        forwarded = await client.forward_messages(target_entity, forwardable_messages)
+        if isinstance(forwarded, list):
+            forwarded_messages = forwarded
+        elif forwarded is None:
+            forwarded_messages = []
+        else:
+            forwarded_messages = [forwarded]
+
+        forwarded_message_ids: List[int] = []
+        for msg in forwarded_messages:
+            try:
+                mid = int(getattr(msg, "id", 0) or 0)
+            except Exception:
+                mid = 0
+
+            if mid > 0:
+                forwarded_message_ids.append(mid)
+
+        return {
+            "status": "ok",
+            "source_chat_id": source_chat_id,
+            "target_bot_username": target_bot_username,
+            "requested_message_ids": message_ids,
+            "missing_message_ids": missing_message_ids,
+            "unforwardable_message_ids": unforwardable_message_ids,
+            "forwarded_message_ids": forwarded_message_ids,
+            "bridge_control_message_id": bridge_control_message_id,
+            "forwarded_count": len(forwarded_message_ids),
+        }
+    except Exception as e:
+        push_log(
+            stage="bots_forward_messages",
+            result="forward_error",
+            extra={
+                "source_chat_id": source_chat_id,
+                "target_bot_username": target_bot_username,
+                "message_ids": message_ids[:120],
+                "error": str(e),
+                "trace": traceback.format_exc()[:1200],
+            },
+        )
+        return {
+            "status": "error",
+            "reason": "forward_failed",
+            "error": str(e),
+            "source_chat_id": source_chat_id,
+            "target_bot_username": target_bot_username,
+            "requested_message_ids": message_ids,
+            "unforwardable_message_ids": [],
+        }
+
+
+@app.post("/bots/delete-messages")
+async def delete_messages_from_chat(payload: DeleteMessagesRequest):
+    chat_peer = str(payload.chat_peer or "").strip()
+    raw_message_ids = list(payload.message_ids or [])
+
+    if not chat_peer:
+        return {
+            "status": "error",
+            "reason": "chat_peer_required",
+        }
+
+    message_ids: List[int] = []
+    seen_ids = set()
+
+    for raw_mid in raw_message_ids:
+        try:
+            mid = int(raw_mid or 0)
+        except Exception:
+            continue
+
+        if mid <= 0 or mid in seen_ids:
+            continue
+
+        seen_ids.add(mid)
+        message_ids.append(mid)
+
+    if not message_ids:
+        return {
+            "status": "error",
+            "reason": "message_ids_required",
+            "chat_peer": chat_peer,
+        }
+
+    connected = await _ensure_client_connected()
+    if not connected:
+        return {
+            "status": "error",
+            "reason": "client_not_connected",
+            "chat_peer": chat_peer,
+            "message_ids": message_ids,
+        }
+
+    try:
+        try:
+            resolved_peer: Any = await client.get_input_entity(int(chat_peer))
+        except Exception:
+            resolved_peer = await client.get_input_entity(chat_peer)
+
+        remaining_message_ids = list(message_ids)
+        for _ in range(3):
+            if not remaining_message_ids:
+                break
+
+            await client.delete_messages(resolved_peer, remaining_message_ids, revoke=True)
+            await asyncio.sleep(0.6)
+            remaining_message_ids = await _find_remaining_message_ids(
+                resolved_peer,
+                remaining_message_ids,
+            )
+
+        deleted_message_ids = [
+            mid for mid in message_ids
+            if mid not in set(remaining_message_ids)
+        ]
+
+        if remaining_message_ids:
+            push_log(
+                stage="bots_delete_messages",
+                result="delete_incomplete",
+                extra={
+                    "chat_peer": chat_peer,
+                    "deleted_message_ids": deleted_message_ids[:120],
+                    "undeleted_message_ids": remaining_message_ids[:120],
+                },
+            )
+
+            return {
+                "status": "error",
+                "reason": "delete_incomplete",
+                "chat_peer": chat_peer,
+                "message_ids": message_ids,
+                "deleted_message_ids": deleted_message_ids,
+                "deleted_count": len(deleted_message_ids),
+                "undeleted_message_ids": remaining_message_ids,
+            }
+
+        return {
+            "status": "ok",
+            "chat_peer": chat_peer,
+            "deleted_message_ids": deleted_message_ids,
+            "deleted_count": len(deleted_message_ids),
+            "undeleted_message_ids": [],
+        }
+    except Exception as e:
+        push_log(
+            stage="bots_delete_messages",
+            result="delete_error",
+            extra={
+                "chat_peer": chat_peer,
+                "message_ids": message_ids[:120],
+                "error": str(e),
+                "trace": traceback.format_exc()[:1200],
+            },
+        )
+        return {
+            "status": "error",
+            "reason": "delete_failed",
+            "error": str(e),
+            "chat_peer": chat_peer,
+            "message_ids": message_ids,
+        }
 
 
 @app.post("/bots/upload-video")
@@ -5189,6 +5611,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
         timeline.append({"step": steps, "status": "done", "reason": reason})
         _freeze_cleanup_window()
         resp = _attach_files({"status": "ok", "reason": reason, "steps": steps, "timeline": timeline})
+        resp["sent_message_id"] = int(cleanup_min_mid or 0)
         resp = _attach_bot_result_snapshot(
             resp,
             bot_username=payload.bot_username,
@@ -5228,6 +5651,7 @@ async def send_and_run_all_pages(payload: SendAndRunAllPagesRequest):
             resp["error"] = error
         _freeze_cleanup_window()
         resp = _attach_files(resp)
+        resp["sent_message_id"] = int(cleanup_min_mid or 0)
         resp = _attach_bot_result_snapshot(
             resp,
             bot_username=payload.bot_username,
@@ -6164,6 +6588,44 @@ async def _resolve_any_entity_by_id(peer_id: int):
         return None
 
 
+async def _resolve_any_input_entity_by_id(peer_id: int):
+    try:
+        return await client.get_input_entity(int(peer_id))
+    except Exception:
+        pass
+
+    try:
+        async for d in client.iter_dialogs(limit=500):
+            try:
+                ent = getattr(d, "entity", None)
+                ent_id = int(getattr(ent, "id", 0) or 0)
+            except Exception:
+                ent = None
+                ent_id = 0
+
+            if ent is None or ent_id != int(peer_id):
+                continue
+
+            migrated_to = getattr(ent, "migrated_to", None)
+            if migrated_to is not None:
+                try:
+                    return await client.get_input_entity(migrated_to)
+                except Exception:
+                    try:
+                        return migrated_to
+                    except Exception:
+                        pass
+
+            try:
+                return await client.get_input_entity(ent)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return None
+
+
 def _message_to_full_dict(m: Any) -> Dict[str, Any]:
     if m is None:
         return {}
@@ -6446,6 +6908,81 @@ class GroupMessageDownloadRequest(BaseModel):
     folder_label: Optional[str] = None
 
 
+class GroupSendMessageRequest(BaseModel):
+    peer_id: int
+    text: str
+
+
+class BotMessageDownloadRequest(BaseModel):
+    bot_username: str
+    message_id: int
+    folder_label: Optional[str] = None
+
+
+@app.post("/groups/send-message")
+async def send_group_message(payload: GroupSendMessageRequest):
+    peer_id = int(payload.peer_id or 0)
+    text = str(payload.text or "").strip()
+
+    if peer_id <= 0:
+        return {
+            "status": "fail",
+            "reason": "peer_id_required",
+        }
+
+    if text == "":
+        return {
+            "status": "fail",
+            "reason": "text_required",
+            "peer_id": peer_id,
+        }
+
+    connected = await _ensure_client_connected()
+    if not connected:
+        return {
+            "status": "fail",
+            "reason": "client_not_connected",
+            "peer_id": peer_id,
+        }
+
+    input_ent = await _resolve_any_input_entity_by_id(peer_id)
+    if input_ent is None:
+        return {
+            "status": "fail",
+            "reason": "entity_not_found",
+            "peer_id": peer_id,
+        }
+
+    try:
+        sent = await client.send_message(input_ent, text, parse_mode=None, link_preview=False)
+
+        result = {
+            "status": "ok",
+            "peer_id": peer_id,
+            "message_id": int(getattr(sent, "id", 0) or 0),
+            "text": text,
+        }
+        push_log(stage="group_send_message", result="ok", extra=_json_sanitize(result))
+        return result
+    except Exception as e:
+        push_log(
+            stage="group_send_message",
+            result="error",
+            extra={
+                "peer_id": peer_id,
+                "text": text[:200],
+                "error": str(e),
+                "trace": traceback.format_exc()[:800],
+            },
+        )
+        return {
+            "status": "fail",
+            "reason": "send_error",
+            "peer_id": peer_id,
+            "error": str(e),
+        }
+
+
 @app.post("/groups/download-message-media")
 async def download_group_message_media(payload: GroupMessageDownloadRequest):
     try:
@@ -6476,6 +7013,158 @@ async def download_group_message_media(payload: GroupMessageDownloadRequest):
             "reason": "download_error",
             "peer_id": int(payload.peer_id),
             "message_id": int(payload.message_id),
+            "error": str(e),
+        }
+
+
+@app.post("/bots/download-message-media")
+async def download_bot_message_media(payload: BotMessageDownloadRequest):
+    bot_username = str(payload.bot_username or "").strip()
+    message_id = int(payload.message_id or 0)
+
+    if not bot_username:
+        return {
+            "status": "fail",
+            "reason": "bot_username_required",
+        }
+
+    if message_id <= 0:
+        return {
+            "status": "fail",
+            "reason": "message_id_required",
+            "bot_username": bot_username,
+        }
+
+    try:
+        connected = await _ensure_client_connected()
+        if not connected:
+            return {
+                "status": "fail",
+                "reason": "client_not_connected",
+                "bot_username": bot_username,
+                "message_id": message_id,
+            }
+
+        peer = await _get_peer_for_bot(bot_username)
+        if peer is None:
+            return {
+                "status": "fail",
+                "reason": "bot_not_found",
+                "bot_username": bot_username,
+                "message_id": message_id,
+            }
+
+        one = await client.get_messages(peer, ids=message_id)
+        if one is None:
+            return {
+                "status": "fail",
+                "reason": "message_not_found",
+                "bot_username": bot_username,
+                "message_id": message_id,
+            }
+
+        file_obj = _extract_file_meta_mtproto(one)
+        if not file_obj:
+            return {
+                "status": "fail",
+                "reason": "message_has_no_media",
+                "bot_username": bot_username,
+                "message_id": message_id,
+            }
+
+        folder_label = str(payload.folder_label or f"{bot_username}_{message_id}")
+        folder_path = _ensure_download_folder_for_media(
+            folder_label,
+            file_obj.get("file_type"),
+            file_obj.get("mime_type"),
+        )
+        job_id = f"bot-download-{bot_username}-{message_id}-{uuid.uuid4().hex}"
+        file_path = _reserve_download_file_path(
+            folder_path=folder_path,
+            file_obj=file_obj,
+            base_name=_sanitize_for_path(folder_label, max_len=90),
+            index=1,
+            job_id=job_id,
+        )
+
+        downloader = "telethon"
+        telethon_result: Dict[str, Any] = {"ok": False, "reason": "not_attempted"}
+        tdl_result = await asyncio.to_thread(
+            _run_tdl_download_for_bot_message,
+            bot_username,
+            message_id,
+            folder_path,
+            file_path,
+        )
+
+        if bool(tdl_result.get("ok")):
+            downloader = "tdl"
+            file_path = str(tdl_result.get("saved_path") or file_path)
+        else:
+            telethon_result = await _download_media_with_telethon_timeout(
+                one,
+                file_path,
+                BACKGROUND_TELETHON_DOWNLOAD_TIMEOUT_SECONDS,
+            )
+            if bool(telethon_result.get("ok")):
+                file_path = str(telethon_result.get("saved_path") or file_path)
+            else:
+                return {
+                    "status": "fail",
+                    "reason": str(telethon_result.get("reason") or "telethon_download_failed"),
+                    "error": str(telethon_result.get("error") or ""),
+                    "bot_username": bot_username,
+                    "message_id": message_id,
+                    "folder_path": folder_path,
+                    "saved_path": telethon_result.get("saved_path"),
+                    "saved_name": telethon_result.get("saved_name"),
+                    "downloader": downloader,
+                    "tdl": _json_sanitize(tdl_result),
+                    "telethon": _json_sanitize(telethon_result),
+                    "file": {
+                        "file_name": file_obj.get("file_name"),
+                        "mime_type": file_obj.get("mime_type"),
+                        "file_size": int(file_obj.get("file_size", 0) or 0),
+                        "file_type": file_obj.get("file_type"),
+                        "file_unique_id": file_obj.get("file_unique_id"),
+                    },
+                }
+
+        return {
+            "status": "ok",
+            "downloaded": True,
+            "bot_username": bot_username,
+            "message_id": message_id,
+            "folder_path": folder_path,
+            "saved_path": file_path,
+            "saved_name": os.path.basename(file_path),
+            "downloader": downloader,
+            "tdl": _json_sanitize(tdl_result),
+            "telethon": _json_sanitize(telethon_result),
+            "file": {
+                "file_name": file_obj.get("file_name"),
+                "mime_type": file_obj.get("mime_type"),
+                "file_size": int(file_obj.get("file_size", 0) or 0),
+                "file_type": file_obj.get("file_type"),
+                "file_unique_id": file_obj.get("file_unique_id"),
+            },
+        }
+    except Exception as e:
+        push_log(
+            stage="bot_download",
+            result="error",
+            extra={
+                "bot_username": bot_username,
+                "message_id": message_id,
+                "error": str(e),
+                "trace": traceback.format_exc()[:800],
+            },
+        )
+        return {
+            "status": "fail",
+            "reason": "download_error",
+            "bot_username": bot_username,
+            "message_id": message_id,
             "error": str(e),
         }
 
