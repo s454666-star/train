@@ -1,27 +1,5 @@
-@echo on
-chcp 65001
-
-echo ===============================
-echo START TELEGRAM FASTAPI SERVICE
-echo ===============================
-echo.
-
+@echo off
+setlocal
 cd /d C:\Users\User\Pictures\train
-echo Current dir:
-cd
-echo.
-
-echo Using python:
-C:\Users\User\Pictures\train\venv\Scripts\python.exe --version
-echo.
-
-echo Starting uvicorn...
-echo.
-
-C:\Users\User\Pictures\train\venv\Scripts\python.exe -m uvicorn telegram_service2:app --host 0.0.0.0 --port 8001
-
-echo.
-echo ===============================
-echo PROCESS EXITED
-echo ===============================
-pause
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\User\Pictures\train\start_telegram_service2.ps1"
+exit /b %ERRORLEVEL%
