@@ -12,6 +12,7 @@ venv/
 # Logs
 *.log
 logs/
+cache/
 
 # IDE
 .idea/
