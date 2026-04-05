@@ -1,0 +1,2 @@
+& "$PSScriptRoot\start_telegram_service_port.ps1" -ModuleName 'telegram_service3' -Port 8002
+& "$PSScriptRoot\start_helper.ps1"
