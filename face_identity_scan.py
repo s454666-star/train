@@ -183,7 +183,23 @@ class FaceIdentityScanner:
             autocommit=True,
         )
 
+    def _ensure_connection(self) -> None:
+        try:
+            if self.connection.is_connected():
+                self.connection.ping(reconnect=True, attempts=3, delay=2)
+                return
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            self.connection.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+        self.connection = self._connect_database()
+
     def _assert_schema(self) -> None:
+        self._ensure_connection()
         tables = (
             "face_identity_people",
             "face_identity_videos",
@@ -276,12 +292,12 @@ class FaceIdentityScanner:
 
         duration_seconds = probe_duration_seconds(absolute_path)
         self.logger.info(
-            "開始分析 %s | duration=%.1fs | interval=%ss | success_skip=%ss | max_samples=%s",
+            "開始分析 %s | duration=%.1fs | interval=%ss | full_scan=1 | max_samples=%s | min_gap=%ss",
             absolute_path.name,
             duration_seconds,
             config.FRAME_INTERVAL_SECONDS,
-            config.SECONDS_TO_SKIP_AFTER_SUCCESS,
             config.MAX_SAMPLES_PER_VIDEO,
+            config.FINAL_SAMPLE_MIN_GAP_SECONDS,
         )
         selected_samples, metadata = self._extract_video_faces(absolute_path, duration_seconds)
 
@@ -299,8 +315,8 @@ class FaceIdentityScanner:
             metadata.get("dominant_cluster_size", 0),
             metadata.get("rejected_counts", {}),
         )
-        if metadata.get("accepted_seconds"):
-            self.logger.info("有效樣本秒數 %s | %s", absolute_path.name, metadata["accepted_seconds"])
+        if metadata.get("selected_seconds"):
+            self.logger.info("最終樣本秒數 %s | %s", absolute_path.name, metadata["selected_seconds"])
 
         self._persist_result(
             item=item,
@@ -327,7 +343,7 @@ class FaceIdentityScanner:
         rejected_counts: dict[str, int] = {}
         checked_seconds: list[float] = []
         debug_events: list[dict[str, Any]] = []
-        accepted_seconds: list[float] = []
+        candidate_seconds: list[float] = []
         detected_face_frame_count = 0
         current_second = float(config.FIRST_SAMPLE_OFFSET_SECONDS)
         checked_frame_count = 0
@@ -398,10 +414,10 @@ class FaceIdentityScanner:
 
                 self._assign_candidate_to_cluster(clusters, best_candidate)
                 best_cluster = pick_best_cluster(clusters)
-                accepted_seconds.append(round(best_candidate.capture_second, 3))
+                candidate_seconds.append(round(best_candidate.capture_second, 3))
                 event = {
                     "second": best_candidate.capture_second,
-                    "status": "accepted",
+                    "status": "candidate",
                     "reason": None,
                     "cluster_size": len(best_cluster.samples) if best_cluster else 1,
                     **(best_debug_info or {}),
@@ -414,20 +430,16 @@ class FaceIdentityScanner:
                     rejection_log_suppressed,
                     always=True,
                 )
-                current_second += float(config.SECONDS_TO_SKIP_AFTER_SUCCESS)
-                if best_cluster and len(best_cluster.samples) >= config.MAX_SAMPLES_PER_VIDEO:
-                    break
+                current_second += float(config.FRAME_INTERVAL_SECONDS)
         finally:
             capture.release()
 
         best_cluster = pick_best_cluster(clusters)
         selected_samples: list[FaceCandidate] = []
+        selected_seconds: list[float] = []
         if best_cluster is not None:
-            selected_samples = sorted(
-                best_cluster.samples,
-                key=lambda sample: (-sample.quality_score, sample.capture_second),
-            )[: config.MAX_SAMPLES_PER_VIDEO]
-            selected_samples = sorted(selected_samples, key=lambda sample: sample.capture_second)
+            selected_samples = self._select_final_samples(best_cluster.samples)
+            selected_seconds = sorted(round(sample.capture_second, 3) for sample in selected_samples)
 
         metadata = {
             "checked_frame_seconds": checked_seconds,
@@ -435,11 +447,76 @@ class FaceIdentityScanner:
             "detected_face_frame_count": detected_face_frame_count,
             "candidate_cluster_count": len(clusters),
             "dominant_cluster_size": len(best_cluster.samples) if best_cluster else 0,
-            "accepted_seconds": accepted_seconds,
+            "candidate_seconds": candidate_seconds,
+            "selected_seconds": selected_seconds,
             "rejected_counts": rejected_counts,
             "debug_events": debug_events,
         }
         return selected_samples, metadata
+
+    def _select_final_samples(self, samples: list[FaceCandidate]) -> list[FaceCandidate]:
+        if not samples:
+            return []
+
+        ranked_samples = sorted(
+            samples,
+            key=lambda sample: (
+                -sample.quality_score,
+                -sample.blur_score,
+                -sample.frontal_score,
+                -sample.detector_score,
+                sample.capture_second,
+            ),
+        )
+        selected: list[FaceCandidate] = []
+        selected_ids: set[int] = set()
+        min_gap = max(float(config.FINAL_SAMPLE_MIN_GAP_SECONDS), 0.0)
+        gap_steps = [min_gap]
+
+        if min_gap > 0:
+            gap_steps.extend([
+                min_gap * 0.65,
+                min_gap * 0.35,
+                0.0,
+            ])
+
+        for gap in gap_steps:
+            for sample in ranked_samples:
+                if id(sample) in selected_ids:
+                    continue
+                if gap > 0 and any(
+                    abs(sample.capture_second - existing.capture_second) < gap
+                    for existing in selected
+                ):
+                    continue
+
+                selected.append(sample)
+                selected_ids.add(id(sample))
+                if len(selected) >= config.MAX_SAMPLES_PER_VIDEO:
+                    break
+
+            if len(selected) >= config.MAX_SAMPLES_PER_VIDEO:
+                break
+
+        if len(selected) < min(len(ranked_samples), config.MAX_SAMPLES_PER_VIDEO):
+            for sample in ranked_samples:
+                if id(sample) in selected_ids:
+                    continue
+                selected.append(sample)
+                selected_ids.add(id(sample))
+                if len(selected) >= config.MAX_SAMPLES_PER_VIDEO:
+                    break
+
+        return sorted(
+            selected,
+            key=lambda sample: (
+                -sample.quality_score,
+                -sample.blur_score,
+                -sample.frontal_score,
+                -sample.detector_score,
+                sample.capture_second,
+            ),
+        )
 
     def _pick_best_face(
         self,
@@ -607,6 +684,7 @@ class FaceIdentityScanner:
         selected_samples: list[FaceCandidate],
         metadata: dict[str, Any],
     ) -> None:
+        self._ensure_connection()
         cursor = self.connection.cursor(dictionary=True)
         old_person_id = int(existing["person_id"]) if existing and existing.get("person_id") else None
         old_sample_paths: list[str] = []
@@ -927,6 +1005,7 @@ class FaceIdentityScanner:
         return int(cursor.lastrowid), None, True
 
     def _rebuild_groups(self) -> None:
+        self._ensure_connection()
         cursor = self.connection.cursor(dictionary=True)
 
         try:
@@ -1344,6 +1423,10 @@ class FaceIdentityScanner:
             int(forward["matched_sample_count"]),
             int(backward["matched_sample_count"]),
         )
+        median_similarity = min(
+            float(forward["median_similarity"]),
+            float(backward["median_similarity"]),
+        )
         max_similarity = min(
             float(forward["max_similarity"]),
             float(backward["max_similarity"]),
@@ -1353,11 +1436,17 @@ class FaceIdentityScanner:
             return None
         if matched_sample_count < config.PERSON_VIDEO_MIN_MATCHED_SAMPLES:
             return None
+        if (
+            matched_sample_count < config.PERSON_VIDEO_CONFIDENT_MATCHED_SAMPLES
+            and median_similarity < config.PERSON_VIDEO_MEDIAN_SUPPORT_THRESHOLD
+        ):
+            return None
 
         return {
             "centroid_similarity": centroid_similarity,
             "top_average_similarity": top_average_similarity,
             "matched_sample_count": float(matched_sample_count),
+            "median_similarity": median_similarity,
             "max_similarity": max_similarity,
         }
 
@@ -1370,6 +1459,7 @@ class FaceIdentityScanner:
             return {
                 "max_similarity": 0.0,
                 "top_average_similarity": 0.0,
+                "median_similarity": 0.0,
                 "matched_sample_count": 0.0,
             }
 
@@ -1386,6 +1476,7 @@ class FaceIdentityScanner:
             return {
                 "max_similarity": 0.0,
                 "top_average_similarity": 0.0,
+                "median_similarity": 0.0,
                 "matched_sample_count": 0.0,
             }
 
@@ -1395,6 +1486,7 @@ class FaceIdentityScanner:
         return {
             "max_similarity": per_sample_maxima[0],
             "top_average_similarity": sum(per_sample_maxima[:top_count]) / top_count,
+            "median_similarity": float(np.median(per_sample_maxima)),
             "matched_sample_count": float(
                 sum(
                     1
@@ -1486,6 +1578,7 @@ class FaceIdentityScanner:
         )
 
     def _persist_error(self, item: DiscoveredVideo, message: str) -> None:
+        self._ensure_connection()
         absolute_path = item.video_path.resolve()
         file_stat = absolute_path.stat()
         modified_at = datetime.fromtimestamp(file_stat.st_mtime).replace(microsecond=0)
@@ -1589,6 +1682,7 @@ class FaceIdentityScanner:
             cursor.close()
 
     def _find_existing_video(self, path_sha1: str) -> Optional[dict[str, Any]]:
+        self._ensure_connection()
         cursor = self.connection.cursor(dictionary=True)
         try:
             cursor.execute(
