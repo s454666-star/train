@@ -28,6 +28,7 @@ import logging
 import faulthandler
 import atexit
 import platform
+import time
 from urllib import request as urllib_request
 from urllib import error as urllib_error
 
@@ -86,6 +87,14 @@ def _configure_logger() -> logging.Logger:
 
 
 LOGGER = _configure_logger()
+
+DB_MAX_RECONNECT_ATTEMPTS = 20
+DB_RECONNECT_DELAY_SECONDS = 3.0
+DB_CONNECTION_ERROR_NUMBERS = {2002, 2003, 2006, 2013, 2014, 2045, 2055}
+
+
+class DatabaseReconnectFailed(RuntimeError):
+    pass
 
 
 def _flush_logs() -> None:
@@ -276,27 +285,9 @@ class FaceExtractorApp:
         except Exception:
             self._haar_face = None
 
-        try:
-            db_config = load_db_config(prefix="STAR")
-            LOGGER.info("準備連接資料庫 host=%s port=%s database=%s", db_config["host"], db_config["port"], db_config["database"])
-            _flush_logs()
-        except Exception:
-            pass
-        try:
-            db_config = load_db_config(prefix="STAR")
-            self.db_connection = mysql.connector.connect(**db_config)
-            self.db_cursor = self.db_connection.cursor()
-            print("成功連接到資料庫")
-        except mysql.connector.Error as err:
-            print(f"資料庫連線錯誤: {err}")
-            self._update_current_file(f"資料庫連線失敗：{err}")
-            self.db_connection = None
-            self.db_cursor = None
-        except ValueError as err:
-            print(f"資料庫 ENV 設定錯誤: {err}")
-            self._update_current_file(f"資料庫 ENV 設定錯誤：{err}")
-            self.db_connection = None
-            self.db_cursor = None
+        self.db_connection = None
+        self.db_cursor = None
+        self.connect_database()
 
     # ===== 修復：每個 thread 都有自己的 detector =====
     def _get_mtcnn_detector(self) -> MTCNN:
@@ -385,6 +376,219 @@ class FaceExtractorApp:
     def ensure_dir(self, path: str) -> None:
         abs_path = os.path.abspath(path)
         os.makedirs(abs_path, exist_ok=True)
+
+    def _close_db_handles(self) -> None:
+        try:
+            if getattr(self, "db_cursor", None):
+                try:
+                    self.db_cursor.close()
+                except Exception:
+                    pass
+        finally:
+            self.db_cursor = None
+
+        try:
+            if getattr(self, "db_connection", None):
+                try:
+                    self.db_connection.close()
+                except Exception:
+                    pass
+        finally:
+            self.db_connection = None
+
+    def _open_database_connection(self) -> None:
+        db_config = load_db_config(prefix="STAR")
+        try:
+            LOGGER.info(
+                "準備連接資料庫 host=%s port=%s database=%s",
+                db_config["host"],
+                db_config["port"],
+                db_config["database"],
+            )
+            _flush_logs()
+        except Exception:
+            pass
+
+        self.db_connection = mysql.connector.connect(**db_config)
+        self.db_cursor = self.db_connection.cursor()
+
+    def connect_database(self) -> bool:
+        try:
+            self._close_db_handles()
+            self._open_database_connection()
+            print("成功連接到資料庫")
+            return True
+        except mysql.connector.Error as err:
+            print(f"資料庫連線錯誤: {err}")
+            self._update_current_file(f"資料庫連線失敗：{err}")
+            self.db_connection = None
+            self.db_cursor = None
+            return False
+        except ValueError as err:
+            print(f"資料庫 ENV 設定錯誤: {err}")
+            self._update_current_file(f"資料庫 ENV 設定錯誤：{err}")
+            self.db_connection = None
+            self.db_cursor = None
+            return False
+
+    def _is_db_connected(self) -> bool:
+        try:
+            return bool(self.db_connection and self.db_cursor and self.db_connection.is_connected())
+        except Exception:
+            return False
+
+    def _is_db_connection_error(self, err: mysql.connector.Error) -> bool:
+        errno = getattr(err, "errno", None)
+        if errno in DB_CONNECTION_ERROR_NUMBERS:
+            return True
+
+        msg = str(err).lower()
+        return any(
+            token in msg
+            for token in (
+                "not connected",
+                "connection not available",
+                "server has gone away",
+                "lost connection",
+                "can't connect",
+                "cannot connect",
+                "connection refused",
+                "connection reset",
+                "broken pipe",
+            )
+        )
+
+    def _run_db_operation(self, operation_name: str, action):
+        last_error = None
+
+        for attempt in range(1, DB_MAX_RECONNECT_ATTEMPTS + 1):
+            try:
+                if not self._is_db_connected():
+                    self._close_db_handles()
+                    self._open_database_connection()
+                    print("成功重新連接到資料庫")
+
+                return action()
+            except mysql.connector.Error as err:
+                if not self._is_db_connection_error(err):
+                    raise
+
+                last_error = err
+                self._close_db_handles()
+
+                message = (
+                    f"{operation_name} 連不到DB，嘗試重連 "
+                    f"({attempt}/{DB_MAX_RECONNECT_ATTEMPTS})：{err}"
+                )
+                print(message)
+                self._update_current_file(f"DB重連 {attempt}/{DB_MAX_RECONNECT_ATTEMPTS}：{operation_name}")
+                try:
+                    LOGGER.warning(message)
+                    _flush_logs()
+                except Exception:
+                    pass
+
+                if attempt < DB_MAX_RECONNECT_ATTEMPTS:
+                    time.sleep(DB_RECONNECT_DELAY_SECONDS)
+
+        raise DatabaseReconnectFailed(
+            f"{operation_name} 連不到DB，已嘗試重連 {DB_MAX_RECONNECT_ATTEMPTS} 次仍失敗"
+        ) from last_error
+
+    def db_execute(self, sql: str, params: Optional[Tuple[Any, ...]] = None, operation_name: str = "資料庫操作"):
+        def action():
+            self.db_cursor.execute(sql, params or ())
+            return self.db_cursor
+
+        return self._run_db_operation(operation_name, action)
+
+    def db_execute_fetchone(self, sql: str, params: Optional[Tuple[Any, ...]] = None, operation_name: str = "資料庫查詢"):
+        def action():
+            self.db_cursor.execute(sql, params or ())
+            return self.db_cursor.fetchone()
+
+        return self._run_db_operation(operation_name, action)
+
+    def db_execute_fetchall(self, sql: str, params: Optional[Tuple[Any, ...]] = None, operation_name: str = "資料庫查詢"):
+        def action():
+            self.db_cursor.execute(sql, params or ())
+            return self.db_cursor.fetchall()
+
+        return self._run_db_operation(operation_name, action)
+
+    def db_execute_commit(self, sql: str, params: Optional[Tuple[Any, ...]] = None, operation_name: str = "資料庫寫入"):
+        def action():
+            self.db_cursor.execute(sql, params or ())
+            self.db_connection.commit()
+            return self.db_cursor
+
+        return self._run_db_operation(operation_name, action)
+
+    def db_execute_commit_lastrowid(
+        self,
+        sql: str,
+        params: Optional[Tuple[Any, ...]] = None,
+        operation_name: str = "資料庫寫入",
+    ) -> int:
+        def action():
+            self.db_cursor.execute(sql, params or ())
+            lastrowid = int(self.db_cursor.lastrowid)
+            self.db_connection.commit()
+            return lastrowid
+
+        return self._run_db_operation(operation_name, action)
+
+    def db_commit(self, operation_name: str = "資料庫提交") -> None:
+        self._run_db_operation(operation_name, lambda: self.db_connection.commit())
+
+    def db_rollback_safely(self) -> None:
+        try:
+            if self._is_db_connected():
+                self.db_connection.rollback()
+        except Exception:
+            pass
+
+    def rollback_video_files(self, rollback_state: Dict[str, Any], reason: str) -> None:
+        print(f"開始回朔本次影片檔案，原因：{reason}")
+
+        retry_copy_path = rollback_state.get("retry_copy_path")
+        if retry_copy_path and os.path.exists(retry_copy_path):
+            try:
+                os.remove(retry_copy_path)
+                print(f"已刪除重跑副本: {retry_copy_path}")
+            except Exception as err:
+                print(f"刪除重跑副本失敗: {retry_copy_path}, 錯誤: {err}")
+
+        moved_video = rollback_state.get("moved_video")
+        if moved_video:
+            moved_path, original_path = moved_video
+            try:
+                if os.path.exists(moved_path) and not os.path.exists(original_path):
+                    self.ensure_dir(os.path.dirname(original_path))
+                    shutil.move(moved_path, original_path)
+                    print(f"已還原影片檔案: {original_path}")
+                elif os.path.exists(moved_path):
+                    print(f"原始影片路徑已存在，保留已搬移檔案: {moved_path}")
+            except Exception as err:
+                print(f"還原影片檔案失敗: {moved_path} -> {original_path}, 錯誤: {err}")
+
+        for created_file in reversed(rollback_state.get("created_files", [])):
+            try:
+                if created_file and os.path.exists(created_file):
+                    os.remove(created_file)
+                    print(f"已刪除本次產生檔案: {created_file}")
+            except Exception as err:
+                print(f"刪除本次產生檔案失敗: {created_file}, 錯誤: {err}")
+
+        for created_dir in reversed(rollback_state.get("created_dirs", [])):
+            try:
+                if created_dir and os.path.isdir(created_dir):
+                    os.rmdir(created_dir)
+                    print(f"已移除空輸出目錄: {created_dir}")
+            except OSError:
+                pass
+            except Exception as err:
+                print(f"移除輸出目錄失敗: {created_dir}, 錯誤: {err}")
 
     def build_output_video_name(self, output_dir: str, original_video_path: str) -> str:
         output_base_name = os.path.basename(os.path.abspath(output_dir))
@@ -649,7 +853,7 @@ class FaceExtractorApp:
         )
 
     def find_master_face_id(self, video_master_id: int) -> Optional[int]:
-        if not self.db_cursor or not video_master_id:
+        if not video_master_id:
             return None
 
         sql = """
@@ -660,14 +864,13 @@ class FaceExtractorApp:
               AND vfs.is_master = 1
             LIMIT 1
         """
-        self.db_cursor.execute(sql, (video_master_id,))
-        row = self.db_cursor.fetchone()
+        row = self.db_execute_fetchone(sql, (video_master_id,), "查詢 master face")
         if not row:
             return None
         return int(row[0])
 
     def clear_existing_video_features(self, video_master_id: int) -> None:
-        if not self.db_cursor or not video_master_id:
+        if not video_master_id:
             return
 
         select_sql = """
@@ -676,8 +879,7 @@ class FaceExtractorApp:
             INNER JOIN video_features vf ON vf.id = vff.video_feature_id
             WHERE vf.video_master_id = %s
         """
-        self.db_cursor.execute(select_sql, (video_master_id,))
-        rows = self.db_cursor.fetchall() or []
+        rows = self.db_execute_fetchall(select_sql, (video_master_id,), "查詢既有影片特徵") or []
 
         for screenshot_id, screenshot_path in rows:
             if screenshot_path:
@@ -690,12 +892,20 @@ class FaceExtractorApp:
                         pass
 
             if screenshot_id:
-                self.db_cursor.execute("DELETE FROM video_screenshots WHERE id = %s", (int(screenshot_id),))
+                self.db_execute_commit(
+                    "DELETE FROM video_screenshots WHERE id = %s",
+                    (int(screenshot_id),),
+                    "刪除既有特徵截圖",
+                )
 
-        self.db_cursor.execute("DELETE FROM video_features WHERE video_master_id = %s", (video_master_id,))
+        self.db_execute_commit(
+            "DELETE FROM video_features WHERE video_master_id = %s",
+            (video_master_id,),
+            "刪除既有影片特徵",
+        )
 
     def update_video_feature_error(self, video_master_id: int, video_name: str, relative_video_path: str, duration: float, message: str) -> None:
-        if not self.db_cursor or not video_master_id:
+        if not video_master_id:
             return
 
         relative_video_path = self.normalize_db_relative_path(relative_video_path)
@@ -742,7 +952,7 @@ class FaceExtractorApp:
                 updated_at = NOW()
         """
 
-        self.db_cursor.execute(
+        self.db_execute_commit(
             sql,
             (
                 video_master_id,
@@ -761,8 +971,8 @@ class FaceExtractorApp:
                 "10s_x4",
                 message[:65535],
             ),
+            "更新影片特徵錯誤",
         )
-        self.db_connection.commit()
 
     def create_video_feature_records(
         self,
@@ -771,8 +981,9 @@ class FaceExtractorApp:
         destination_path: str,
         clean_folder_name: str,
         duration: float,
+        tracked_created_files: Optional[List[str]] = None,
     ) -> None:
-        if not self.db_cursor or not self.db_connection or not video_master_id:
+        if not video_master_id:
             return
 
         relative_video_path = self.build_db_relative_path(output_dir, os.path.basename(destination_path))
@@ -842,7 +1053,7 @@ class FaceExtractorApp:
                     updated_at = NOW()
             """
 
-            self.db_cursor.execute(
+            self.db_execute_commit(
                 feature_sql,
                 (
                     video_master_id,
@@ -860,10 +1071,14 @@ class FaceExtractorApp:
                     "v1",
                     capture_rule,
                 ),
+                "寫入影片特徵",
             )
 
-            self.db_cursor.execute("SELECT id FROM video_features WHERE video_master_id = %s", (video_master_id,))
-            feature_row = self.db_cursor.fetchone()
+            feature_row = self.db_execute_fetchone(
+                "SELECT id FROM video_features WHERE video_master_id = %s",
+                (video_master_id,),
+                "查詢影片特徵",
+            )
             if not feature_row:
                 raise RuntimeError(f"找不到 video_features：video_master_id={video_master_id}")
             video_feature_id = int(feature_row[0])
@@ -887,17 +1102,19 @@ class FaceExtractorApp:
                 )
                 used_capture_second_keys.add(f"{capture_second:.3f}")
                 created_files.append(feature_path)
+                if tracked_created_files is not None:
+                    tracked_created_files.append(feature_path)
 
                 screenshot_db_path = self.build_db_relative_path(output_dir, os.path.basename(feature_path))
 
-                self.db_cursor.execute(
+                screenshot_id = self.db_execute_commit_lastrowid(
                     """
                         INSERT INTO video_screenshots (video_master_id, screenshot_path)
                         VALUES (%s, %s)
                     """,
                     (video_master_id, screenshot_db_path),
+                    "寫入特徵截圖",
                 )
-                screenshot_id = int(self.db_cursor.lastrowid)
 
                 dhash_hex = self.compute_dhash_hex(feature_path)
                 with Image.open(feature_path) as feature_image:
@@ -906,7 +1123,7 @@ class FaceExtractorApp:
                 with open(feature_path, "rb") as image_fp:
                     frame_sha1.update(image_fp.read())
 
-                self.db_cursor.execute(
+                self.db_execute_commit(
                     """
                         INSERT INTO video_feature_frames
                         (
@@ -938,6 +1155,7 @@ class FaceExtractorApp:
                         image_width,
                         image_height,
                     ),
+                    "寫入特徵影格",
                 )
 
                 inserted_count += 1
@@ -945,7 +1163,7 @@ class FaceExtractorApp:
             if inserted_count <= 0:
                 raise RuntimeError("無法建立任何影片特徵截圖")
 
-            self.db_cursor.execute(
+            self.db_execute_commit(
                 """
                     UPDATE video_features
                     SET screenshot_count = %s,
@@ -960,16 +1178,21 @@ class FaceExtractorApp:
                     self.find_master_face_id(video_master_id),
                     video_feature_id,
                 ),
+                "更新影片特徵統計",
             )
 
-            self.db_connection.commit()
             print(f"已建立影片特徵資料，video_master_id={video_master_id}, feature_frames={inserted_count}")
         except Exception as err:
-            self.db_connection.rollback()
+            self.db_rollback_safely()
             for created_file in created_files:
                 try:
                     if created_file and os.path.exists(created_file):
                         os.remove(created_file)
+                except Exception:
+                    pass
+                try:
+                    if tracked_created_files is not None and created_file in tracked_created_files:
+                        tracked_created_files.remove(created_file)
                 except Exception:
                     pass
             try:
@@ -1237,6 +1460,7 @@ class FaceExtractorApp:
             _flush_logs()
         except Exception:
             pass
+        aborted_by_db_failure = False
         while self.is_running and self.video_list:
             if self.current_index >= len(self.video_list):
                 self.current_index = 0
@@ -1249,6 +1473,12 @@ class FaceExtractorApp:
             output_dir = self.get_unique_output_dir_starting_from_1(parent_dir, clean_folder_name)
             output_dir = os.path.abspath(output_dir)
             output_video_name = self.build_output_video_name(output_dir, video_path)
+            rollback_state: Dict[str, Any] = {
+                "created_files": [],
+                "created_dirs": [],
+                "moved_video": None,
+                "retry_copy_path": None,
+            }
 
             try:
                 LOGGER.info("開始處理影片 index=%s/%s path=%s", self.current_index + 1, max(len(self.video_list), 1), video_path)
@@ -1260,6 +1490,7 @@ class FaceExtractorApp:
 
             try:
                 self.ensure_dir(output_dir)
+                rollback_state["created_dirs"].append(output_dir)
                 print(f"已確保輸出目錄: {output_dir}")
             except Exception as e:
                 print(f"無法創建輸出目錄: {output_dir}, 錯誤: {e}")
@@ -1298,26 +1529,17 @@ class FaceExtractorApp:
 
                 video_type = self.video_type_var.get() if self.video_type_var.get() else "1"
 
-                video_master_id = None
-                if self.db_cursor:
-                    try:
-                        insert_video = """
-                            INSERT INTO video_master (video_name, video_path, duration, video_type)
-                            VALUES (%s, %s, %s, %s)
-                        """
-                        relative_video_path = self.build_db_relative_path(output_dir, output_video_name)
-                        self.db_cursor.execute(insert_video, (output_video_name, relative_video_path, round(duration, 3), video_type))
-                        self.db_connection.commit()
-                        video_master_id = self.db_cursor.lastrowid
-                        print(f"已插入 video_master, ID: {video_master_id}")
-                    except mysql.connector.Error as err:
-                        try:
-                            LOGGER.exception("插入 video_master 失敗: %s", err)
-                            _flush_logs()
-                        except Exception:
-                            pass
-                        print(f"插入 video_master 時發生錯誤: {err}")
-                        traceback.print_exc()
+                insert_video = """
+                    INSERT INTO video_master (video_name, video_path, duration, video_type)
+                    VALUES (%s, %s, %s, %s)
+                """
+                relative_video_path = self.build_db_relative_path(output_dir, output_video_name)
+                video_master_id = self.db_execute_commit_lastrowid(
+                    insert_video,
+                    (output_video_name, relative_video_path, round(duration, 3), video_type),
+                    "插入 video_master",
+                )
+                print(f"已插入 video_master, ID: {video_master_id}")
 
                 saved = 0
 
@@ -1347,6 +1569,7 @@ class FaceExtractorApp:
                         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         pil_image = Image.fromarray(rgb_frame)
                         pil_image.save(frame_path)
+                        rollback_state["created_files"].append(frame_path)
                         print(f"成功儲存截圖至: {frame_path}")
                     except Exception as e:
                         print(f"儲存影像時發生錯誤: {e}")
@@ -1354,25 +1577,17 @@ class FaceExtractorApp:
                         continue
 
                     screenshot_id = None
-                    if self.db_cursor and video_master_id:
-                        try:
-                            insert_screenshot = """
-                                INSERT INTO video_screenshots (video_master_id, screenshot_path)
-                                VALUES (%s, %s)
-                            """
-                            screenshot_db_path = self.build_db_relative_path(output_dir, os.path.basename(frame_path))
-                            self.db_cursor.execute(insert_screenshot, (video_master_id, screenshot_db_path))
-                            self.db_connection.commit()
-                            screenshot_id = self.db_cursor.lastrowid
-                            print(f"已插入 video_screenshots, ID: {screenshot_id}")
-                        except mysql.connector.Error as err:
-                            try:
-                                LOGGER.exception("插入 video_screenshots 失敗: %s", err)
-                                _flush_logs()
-                            except Exception:
-                                pass
-                            print(f"插入 video_screenshots 時發生錯誤: {err}")
-                            traceback.print_exc()
+                    insert_screenshot = """
+                        INSERT INTO video_screenshots (video_master_id, screenshot_path)
+                        VALUES (%s, %s)
+                    """
+                    screenshot_db_path = self.build_db_relative_path(output_dir, os.path.basename(frame_path))
+                    screenshot_id = self.db_execute_commit_lastrowid(
+                        insert_screenshot,
+                        (video_master_id, screenshot_db_path),
+                        "插入 video_screenshots",
+                    )
+                    print(f"已插入 video_screenshots, ID: {screenshot_id}")
 
                     self._update_current_file(os.path.basename(frame_path))
 
@@ -1398,27 +1613,23 @@ class FaceExtractorApp:
                                     rgb_face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
                                     pil_face = Image.fromarray(rgb_face)
                                     pil_face.save(face_path)
+                                    rollback_state["created_files"].append(face_path)
                                     print(f"成功儲存人臉至: {face_path}")
 
-                                    if self.db_cursor and screenshot_id:
-                                        try:
-                                            insert_face = """
-                                                INSERT INTO video_face_screenshots (video_screenshot_id, face_image_path)
-                                                VALUES (%s, %s)
-                                            """
-                                            face_db_path = self.build_db_relative_path(output_dir, os.path.basename(face_path))
-                                            self.db_cursor.execute(insert_face, (screenshot_id, face_db_path))
-                                            self.db_connection.commit()
-                                            print(f"已插入 video_face_screenshots")
-                                        except mysql.connector.Error as err:
-                                            try:
-                                                LOGGER.exception("插入 video_face_screenshots 失敗: %s", err)
-                                                _flush_logs()
-                                            except Exception:
-                                                pass
-                                            print(f"插入 video_face_screenshots 時發生錯誤: {err}")
-                                            traceback.print_exc()
+                                    insert_face = """
+                                        INSERT INTO video_face_screenshots (video_screenshot_id, face_image_path)
+                                        VALUES (%s, %s)
+                                    """
+                                    face_db_path = self.build_db_relative_path(output_dir, os.path.basename(face_path))
+                                    self.db_execute_commit(
+                                        insert_face,
+                                        (screenshot_id, face_db_path),
+                                        "插入 video_face_screenshots",
+                                    )
+                                    print(f"已插入 video_face_screenshots")
                             except Exception as e:
+                                if isinstance(e, (DatabaseReconnectFailed, mysql.connector.Error)):
+                                    raise
                                 print(f"儲存人臉時發生錯誤: {e}")
                                 traceback.print_exc()
 
@@ -1436,6 +1647,7 @@ class FaceExtractorApp:
                         raise FileExistsError(f"輸出影片已存在: {destination_path}")
 
                     shutil.move(video_path, destination_path)
+                    rollback_state["moved_video"] = (destination_path, video_path)
                     print(f"已移動影片檔案至: {destination_path}")
 
                     try:
@@ -1445,6 +1657,7 @@ class FaceExtractorApp:
                             destination_path=destination_path,
                             clean_folder_name=clean_folder_name,
                             duration=duration,
+                            tracked_created_files=rollback_state["created_files"],
                         )
                     except Exception as feature_err:
                         try:
@@ -1452,6 +1665,8 @@ class FaceExtractorApp:
                             _flush_logs()
                         except Exception:
                             pass
+                        if isinstance(feature_err, (DatabaseReconnectFailed, mysql.connector.Error)):
+                            raise
                         print(f"建立影片特徵資料時發生錯誤: {feature_err}")
                         traceback.print_exc()
 
@@ -1459,11 +1674,14 @@ class FaceExtractorApp:
                     self.ensure_dir(retry_dir)
                     retry_copy_path = os.path.abspath(os.path.join(retry_dir, output_video_name))
                     shutil.copy2(destination_path, retry_copy_path)
+                    rollback_state["retry_copy_path"] = retry_copy_path
                     print(f"已複製影片檔案至 Z:\\video(重跑): {retry_copy_path}")
 
                     eagle_result = self.import_video_to_eagle_retry_library(destination_path, output_video_name)
                     print(f"已匯入 Eagle 重跑資源: {eagle_result}")
                 except Exception as e:
+                    if isinstance(e, (DatabaseReconnectFailed, mysql.connector.Error)):
+                        raise
                     try:
                         LOGGER.exception("移動影片檔案發生錯誤: %s", e)
                         _flush_logs()
@@ -1473,6 +1691,25 @@ class FaceExtractorApp:
                     traceback.print_exc()
 
                 self.remove_processed_video(self.current_index)
+
+            except (DatabaseReconnectFailed, mysql.connector.Error) as e:
+                try:
+                    LOGGER.exception("DB 寫入失敗，開始回朔本次影片: %s", e)
+                    _flush_logs()
+                except Exception:
+                    pass
+                print(f"DB 寫入失敗，已停止處理並準備回朔: {e}")
+                traceback.print_exc()
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                self.db_rollback_safely()
+                self.rollback_video_files(rollback_state, str(e))
+                self.is_running = False
+                aborted_by_db_failure = True
+                self._update_current_file(f"DB重連失敗，已回朔：{video_name}")
+                break
 
             except Exception as e:
                 print(f"處理影片時發生未預期錯誤: {e}")
@@ -1488,6 +1725,20 @@ class FaceExtractorApp:
             _flush_logs()
         except Exception:
             pass
+        if aborted_by_db_failure:
+            try:
+                self.root.after(
+                    0,
+                    lambda: (
+                        self.start_button.configure(state='normal'),
+                        self.pause_button.configure(state='disabled'),
+                        self.stop_button.configure(state='disabled'),
+                    ),
+                )
+            except Exception:
+                pass
+            return
+
         self.processing_complete()
 
     def _compute_frame_indices(self, total_frames: int, frame_count: int):
