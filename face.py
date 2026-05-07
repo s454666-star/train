@@ -1181,6 +1181,14 @@ class FaceExtractorApp:
                 "更新影片特徵統計",
             )
 
+            if tracked_created_files is not None:
+                for created_file in created_files:
+                    try:
+                        while created_file in tracked_created_files:
+                            tracked_created_files.remove(created_file)
+                    except Exception:
+                        pass
+
             print(f"已建立影片特徵資料，video_master_id={video_master_id}, feature_frames={inserted_count}")
         except Exception as err:
             self.db_rollback_safely()
@@ -1195,6 +1203,10 @@ class FaceExtractorApp:
                         tracked_created_files.remove(created_file)
                 except Exception:
                     pass
+            try:
+                self.clear_existing_video_features(video_master_id)
+            except Exception:
+                pass
             try:
                 self.update_video_feature_error(video_master_id, video_name, relative_video_path, feature_duration, str(err))
             except Exception:
