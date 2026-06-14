@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -44,6 +45,7 @@ if cv2 is not None:
 VIDEO_FILTER = "影片檔案 (*.mp4 *.mkv *.mov *.avi *.wmv *.m4v);;所有檔案 (*.*)"
 TEXT_FILTER = "文字檔案 (*.txt);;所有檔案 (*.*)"
 DEFAULT_OUTPUT_LIST_PATH = r"C:\Users\User\Documents\清單.txt"
+WINDOWS_APP_ID = "Star.VideoTimeClipper"
 SLIDER_STEP_MS = 1000
 PLAYBACK_MAX_FPS = 12.0
 SEEK_DEBOUNCE_MS = 45
@@ -410,6 +412,15 @@ def file_uri(path: str) -> str:
     if not absolute.startswith("/"):
         absolute = "/" + absolute
     return "file://" + absolute
+
+
+def set_windows_app_id() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+    except Exception:
+        return
 
 
 class SegmentList(QListWidget):
@@ -1379,7 +1390,10 @@ class VideoTimeClipper(QMainWindow):
 
 
 def main() -> int:
+    set_windows_app_id()
     app = QApplication(sys.argv)
+    app.setApplicationName("影片時間擷取工具")
+    app.setApplicationDisplayName("影片時間擷取工具")
     app.setWindowIcon(QIcon())
     window = VideoTimeClipper()
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
