@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
 import ctypes
 import faulthandler
@@ -46,6 +48,18 @@ try:
 except ImportError:  # pragma: no cover - only used on machines without PyAV.
     av = None
 
+for _vlc_dir in (r"C:\Program Files\VideoLAN\VLC", r"C:\Program Files (x86)\VideoLAN\VLC"):
+    if os.path.isdir(_vlc_dir):
+        os.environ["PATH"] = _vlc_dir + os.pathsep + os.environ.get("PATH", "")
+        if hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(_vlc_dir)
+        break
+
+try:
+    import vlc
+except ImportError:  # pragma: no cover - only used on machines without python-vlc.
+    vlc = None
+
 if cv2 is not None:
     cv2.setNumThreads(1)
 
@@ -65,6 +79,51 @@ VIDEO_READ_LOCK = threading.RLock()
 PLAYBACK_CATCHUP_FRAME_LIMIT = 8
 PLAYBACK_SEEK_CATCHUP_MS = 1200
 _CRASH_LOG_HANDLE = None
+
+
+def ffmpeg_executable() -> Optional[str]:
+    return shutil.which("ffmpeg") or (r"C:\ffmpeg\bin\ffmpeg.exe" if os.path.isfile(r"C:\ffmpeg\bin\ffmpeg.exe") else None)
+
+
+def read_video_image_with_ffmpeg(video_path: str, position_ms: int, max_width: int, timeout: int = 8) -> QImage:
+    ffmpeg_path = ffmpeg_executable()
+    if not ffmpeg_path:
+        return QImage()
+    cmd = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{max(0, position_ms) / 1000:.3f}",
+        "-i",
+        video_path,
+        "-frames:v",
+        "1",
+        "-vf",
+        f"scale={max(1, int(max_width))}:-2:force_original_aspect_ratio=decrease",
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "pipe:1",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except Exception:
+        return QImage()
+    if result.returncode != 0 or not result.stdout:
+        return QImage()
+    image = QImage()
+    if image.loadFromData(result.stdout):
+        return image.copy()
+    return QImage()
 
 
 def enable_crash_logging() -> None:
@@ -514,43 +573,27 @@ class ThumbnailWorker(QObject):
 
     def run(self) -> None:
         thumbnails: list[tuple[int, QImage]] = []
-        if cv2 is None:
+        ffmpeg_path = ffmpeg_executable()
+        if not ffmpeg_path:
             self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
             return
 
-        try:
-            with VIDEO_READ_LOCK:
-                reader, _ = open_video_reader(self.video_path)
-        except Exception:
-            self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
-            return
+        for index in range(THUMBNAIL_COUNT):
+            if QThread.currentThread().isInterruptionRequested():
+                break
+            if THUMBNAIL_COUNT == 1 or self.view_end_ms <= self.view_start_ms:
+                position_ms = self.view_start_ms
+            else:
+                position_ms = int(
+                    self.view_start_ms
+                    + ((self.view_end_ms - self.view_start_ms) * index) / (THUMBNAIL_COUNT - 1)
+                )
 
-        try:
-            for index in range(THUMBNAIL_COUNT):
-                if QThread.currentThread().isInterruptionRequested():
-                    break
-                if THUMBNAIL_COUNT == 1 or self.view_end_ms <= self.view_start_ms:
-                    position_ms = self.view_start_ms
-                else:
-                    position_ms = int(
-                        self.view_start_ms
-                        + ((self.view_end_ms - self.view_start_ms) * index) / (THUMBNAIL_COUNT - 1)
-                    )
-
-                with VIDEO_READ_LOCK:
-                    ok, frame = reader.seek_read(position_ms)
-                if not ok:
-                    continue
-
-                frame = resize_frame_to_fit(frame, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                height, width, channels = rgb_frame.shape
-                bytes_per_line = channels * width
-                image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+            image = read_video_image_with_ffmpeg(
+                self.video_path, position_ms, THUMBNAIL_MAX_WIDTH, timeout=8
+            )
+            if not image.isNull():
                 thumbnails.append((position_ms, image))
-        finally:
-            with VIDEO_READ_LOCK:
-                reader.release()
 
         self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
 
@@ -630,9 +673,15 @@ class VideoTimeClipper(QMainWindow):
         self._fallback_position_ms = 0
         self._playback_clock_started_at = 0.0
         self._playback_clock_position_ms = 0
+        self._vlc_instance = None
+        self._vlc_player = None
+        self._vlc_active = False
+        self._vlc_playing = False
 
         self.fallback_timer = QTimer(self)
         self.fallback_timer.timeout.connect(self._render_fallback_frame)
+        self.vlc_timer = QTimer(self)
+        self.vlc_timer.timeout.connect(self._sync_vlc_position)
         self.seek_timer = QTimer(self)
         self.seek_timer.setSingleShot(True)
         self.seek_timer.timeout.connect(self._apply_pending_seek)
@@ -677,6 +726,8 @@ class VideoTimeClipper(QMainWindow):
         self.frame_label.setAlignment(Qt.AlignCenter)
         self.frame_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.frame_label.setAcceptDrops(True)
+        self.frame_label.setAttribute(Qt.WA_NativeWindow, True)
+        self.frame_label.setAttribute(Qt.WA_DontCreateNativeAncestors, True)
         self.frame_label.installEventFilter(self.drop_filter)
         player_layout.addWidget(self.frame_label, stretch=1)
 
@@ -1054,6 +1105,7 @@ class VideoTimeClipper(QMainWindow):
             return
 
         self._cancel_thumbnail_worker()
+        self._stop_vlc_playback()
         self._stop_fallback_playback()
         self.video_path = os.path.abspath(path)
         self.pending_start_ms = None
@@ -1082,6 +1134,9 @@ class VideoTimeClipper(QMainWindow):
         QTimer.singleShot(0, lambda: self._start_fallback_playback("逐秒掃描播放模式已啟動"))
 
     def current_position_ms(self) -> int:
+        if self._vlc_active and self._vlc_player is not None:
+            position_ms = int(self._vlc_player.get_time() or 0)
+            return max(0, position_ms)
         if self._fallback_active:
             return int(self._fallback_position_ms)
         return 0
@@ -1202,19 +1257,25 @@ class VideoTimeClipper(QMainWindow):
         return int(view_start), int(view_end)
 
     def _is_currently_playing(self) -> bool:
+        if self._vlc_active:
+            return self._vlc_playing
         if self._fallback_active:
             return self._fallback_playing
         return False
 
     def _pause_for_slider_scan(self) -> None:
-        if self._fallback_active:
+        if self._vlc_active:
+            self._pause_vlc_playback()
+        elif self._fallback_active:
             self._pause_fallback_playback()
 
     def _resume_after_slider_scan(self) -> None:
         if not self._resume_after_slider:
             return
         self._resume_after_slider = False
-        if self._fallback_active:
+        if self._vlc_active:
+            self._resume_vlc_playback()
+        elif self._fallback_active:
             self._resume_fallback_playback()
 
     def _schedule_player_position(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
@@ -1235,13 +1296,149 @@ class VideoTimeClipper(QMainWindow):
     def set_player_position(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
         upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
         position_ms = max(0, min(int(position_ms), upper_bound))
+        if self._vlc_active:
+            self._seek_vlc(position_ms, refresh_thumbnails=refresh_thumbnails)
+            return
         if self._fallback_active:
             self._seek_fallback(position_ms, refresh_thumbnails=refresh_thumbnails)
             return
         self._update_position_labels(position_ms)
 
+    def _start_vlc_playback(self, reason: str) -> bool:
+        if vlc is None or not self.video_path:
+            return False
+        try:
+            if self._vlc_instance is None:
+                self._vlc_instance = vlc.Instance(
+                    "--quiet",
+                    "--no-video-title-show",
+                    "--avcodec-hw=any",
+                    "--file-caching=220",
+                    "--drop-late-frames",
+                    "--skip-frames",
+                )
+            if self._vlc_instance is None:
+                return False
+
+            self._show_safe_preview_frame(0)
+            media = self._vlc_instance.media_new(self.video_path)
+            media.add_option(":file-caching=220")
+            player = self._vlc_instance.media_player_new()
+            player.set_media(media)
+            player.set_hwnd(int(self.frame_label.winId()))
+            player.video_set_key_input(False)
+            player.video_set_mouse_input(False)
+            self._vlc_player = player
+            self._vlc_active = True
+            self._vlc_playing = True
+            self._fallback_active = False
+            self._fallback_playing = False
+            self._fallback_backend = "VLC"
+            self._set_play_button_state(is_playing=True)
+            self.status_label.setText(f"{reason}（VLC 硬體播放器）")
+            self._apply_vlc_crop()
+            if player.play() == -1:
+                self._stop_vlc_playback()
+                return False
+            self.vlc_timer.start(100)
+            QTimer.singleShot(250, self._sync_vlc_position)
+            return True
+        except Exception as exc:
+            self._stop_vlc_playback()
+            self.status_label.setText(f"VLC 播放器啟動失敗，改用備援：{exc}")
+            return False
+
+    def _stop_vlc_playback(self) -> None:
+        self.vlc_timer.stop()
+        if self._vlc_player is not None:
+            try:
+                self._vlc_player.stop()
+                self._vlc_player.release()
+            except Exception:
+                pass
+        self._vlc_player = None
+        self._vlc_active = False
+        self._vlc_playing = False
+
+    def _pause_vlc_playback(self) -> None:
+        if not self._vlc_player:
+            return
+        self._vlc_player.set_pause(1)
+        self._vlc_playing = False
+        self._set_play_button_state(is_playing=False)
+
+    def _resume_vlc_playback(self) -> None:
+        if not self._vlc_player:
+            return
+        self._vlc_player.set_pause(0)
+        self._vlc_playing = True
+        self._set_play_button_state(is_playing=True)
+
+    def _seek_vlc(self, position_ms: int, refresh_thumbnails: bool = True) -> None:
+        if not self._vlc_player:
+            return
+        self._vlc_player.set_time(max(0, int(position_ms)))
+        self._fallback_position_ms = max(0, int(position_ms))
+        self._update_position_labels(self._fallback_position_ms)
+        if refresh_thumbnails:
+            self._schedule_thumbnail_refresh(position_ms)
+
+    def _sync_vlc_position(self) -> None:
+        if not self._vlc_active or self._vlc_player is None:
+            return
+        try:
+            state = self._vlc_player.get_state()
+            length_ms = int(self._vlc_player.get_length() or 0)
+            position_ms = int(self._vlc_player.get_time() or 0)
+        except Exception:
+            return
+
+        if length_ms > 0 and abs(length_ms - self.duration_ms) > 500:
+            self._set_slider_duration(length_ms)
+        if position_ms >= 0:
+            self._fallback_position_ms = position_ms
+            self._update_position_labels(position_ms)
+
+        if vlc is not None and state == vlc.State.Error:
+            self._vlc_playing = False
+            self._set_play_button_state(is_playing=False)
+            self.status_label.setText("VLC 播放這支影片時發生錯誤")
+        elif vlc is not None and state in (vlc.State.Ended, vlc.State.Stopped):
+            self._vlc_playing = False
+            self._set_play_button_state(is_playing=False)
+
+    def _apply_vlc_crop(self) -> None:
+        if not self._vlc_active or self._vlc_player is None:
+            return
+        size = self.frame_label.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        try:
+            self._vlc_player.video_set_crop_geometry(f"{size.width()}:{size.height()}")
+        except Exception:
+            pass
+
+    def _show_safe_preview_frame(self, position_ms: int) -> None:
+        if not self.video_path:
+            return
+        max_width = max(640, min(1920, self.frame_label.width() or 1280))
+        image = read_video_image_with_ffmpeg(self.video_path, position_ms, max_width, timeout=5)
+        if image.isNull():
+            self.frame_label.clear()
+            self.frame_label.setText("正在載入影片...")
+            return
+        self.frame_label.setPixmap(QPixmap.fromImage(image))
+
     def _start_fallback_playback(self, reason: str) -> None:
         if self._fallback_active or not self.video_path:
+            return
+        tried_vlc = vlc is not None
+        if self._start_vlc_playback(reason):
+            return
+        if tried_vlc:
+            self.frame_label.setText("VLC 無法播放這支影片")
+            self.status_label.setText("VLC 播放器無法開啟這支影片，已停止以避免 PyAV/OpenCV 解碼崩潰。")
+            self._set_play_button_state(is_playing=False)
             return
         if cv2 is None:
             self.status_label.setText(f"{reason}，但目前 Python 沒有 OpenCV 可用。")
@@ -1436,6 +1633,12 @@ class VideoTimeClipper(QMainWindow):
 
     def toggle_playback(self) -> None:
         if not self.video_path:
+            return
+        if self._vlc_active:
+            if self._vlc_playing:
+                self._pause_vlc_playback()
+            else:
+                self._resume_vlc_playback()
             return
         if self._fallback_active:
             if self._fallback_playing:
@@ -1636,8 +1839,13 @@ class VideoTimeClipper(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
         self._cancel_thumbnail_worker(wait=True)
+        self._stop_vlc_playback()
         self._stop_fallback_playback()
         super().closeEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        super().resizeEvent(event)
+        self._apply_vlc_crop()
 
     def update_actions(self) -> None:
         has_video = bool(self.video_path)
