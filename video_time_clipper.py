@@ -2357,20 +2357,20 @@ class VideoTimeClipper(QMainWindow):
     def _append_text_block(self, target_path: Path, text: str) -> None:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         newline = self._detect_text_newline(target_path)
-        prefix = ""
-        if target_path.exists() and target_path.stat().st_size > 0:
-            tail = target_path.read_bytes()[-8:]
-            newline_bytes = newline.encode("utf-8")
-            double_newline = newline_bytes + newline_bytes
-            if tail.endswith(double_newline):
-                prefix = ""
-            elif tail.endswith(newline_bytes):
-                prefix = newline
-            else:
-                prefix = newline + newline
+        block = text.rstrip()
+        if not target_path.exists() or target_path.stat().st_size == 0:
+            target_path.write_text(block + newline, encoding="utf-8", newline="")
+            return
 
-        with target_path.open("a", encoding="utf-8", newline="") as handle:
-            handle.write(prefix + text.rstrip() + newline + newline)
+        current = target_path.read_text(encoding="utf-8")
+        current = self._normalize_blank_lines(current, newline).rstrip("\r\n")
+        target_path.write_text(current + newline + newline + block + newline, encoding="utf-8", newline="")
+
+    def _normalize_blank_lines(self, text: str, newline: str) -> str:
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        while "\n\n\n" in normalized:
+            normalized = normalized.replace("\n\n\n", "\n\n")
+        return normalized.replace("\n", newline)
 
     def _detect_text_newline(self, target_path: Path) -> str:
         if not target_path.exists() or target_path.stat().st_size == 0:
