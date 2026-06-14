@@ -61,6 +61,22 @@ def resize_frame_to_fit(frame, max_width: int, max_height: int):
     return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
+def resize_frame_to_cover(frame, target_width: int, target_height: int):
+    height, width = frame.shape[:2]
+    if width <= 0 or height <= 0 or target_width <= 0 or target_height <= 0:
+        return frame
+
+    scale = max(target_width / width, target_height / height)
+    resized_width = max(1, int(width * scale))
+    resized_height = max(1, int(height * scale))
+    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    resized = cv2.resize(frame, (resized_width, resized_height), interpolation=interpolation)
+
+    left = max(0, (resized_width - target_width) // 2)
+    top = max(0, (resized_height - target_height) // 2)
+    return resized[top : top + target_height, left : left + target_width].copy()
+
+
 @dataclass(frozen=True)
 class ClipSegment:
     start_ms: int
@@ -447,8 +463,8 @@ class VideoTimeClipper(QMainWindow):
         central.setAcceptDrops(True)
         central.installEventFilter(self.drop_filter)
         root = QVBoxLayout(central)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
         player_panel = QFrame(self)
         player_panel.setObjectName("playerPanel")
@@ -1070,7 +1086,7 @@ class VideoTimeClipper(QMainWindow):
     def _show_fallback_frame(self, frame) -> None:
         label_size = self.frame_label.size()
         if not label_size.isEmpty():
-            frame = resize_frame_to_fit(frame, label_size.width(), label_size.height())
+            frame = resize_frame_to_cover(frame, label_size.width(), label_size.height())
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width, channels = rgb_frame.shape
         bytes_per_line = channels * width
