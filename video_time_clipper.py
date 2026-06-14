@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon, QImage, QKeySequence, QPixmap
+from PyQt5.QtCore import QEvent, QObject, QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -106,23 +106,179 @@ class ClickableSlider(QSlider):
         super().mouseReleaseEvent(event)
 
 
-class ThumbnailLabel(QLabel):
-    clicked = pyqtSignal(int)
+class ThumbnailRangeStrip(QWidget):
+    rangeChanged = pyqtSignal(int, int)
+    handleMoved = pyqtSignal(int)
 
     def __init__(self) -> None:
         super().__init__()
-        self.position_ms = 0
-        self.setObjectName("thumbnailLabel")
-        self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(86, 48)
+        self.setObjectName("thumbnailStrip")
+        self.setMinimumHeight(76)
+        self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.thumbnails: list[tuple[int, QPixmap]] = []
+        self.duration_ms = 0
+        self.view_start_ms = 0
+        self.view_end_ms = 0
+        self.range_start_ms: Optional[int] = None
+        self.range_end_ms: Optional[int] = None
+        self._dragging_handle: Optional[str] = None
 
     def mousePressEvent(self, event):  # noqa: N802 - Qt override name
         if event.button() == Qt.LeftButton:
-            self.clicked.emit(self.position_ms)
+            handle = self._nearest_handle(event.x())
+            if handle is not None:
+                self._dragging_handle = handle
+                self._move_handle_to_x(event.x())
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802 - Qt override name
+        if self._dragging_handle and event.buttons() & Qt.LeftButton:
+            self._move_handle_to_x(event.x())
             event.accept()
             return
-        super().mousePressEvent(event)
+        hover_handle = self._nearest_handle(event.x())
+        if hover_handle:
+            self.setCursor(Qt.SizeHorCursor)
+        else:
+            self.unsetCursor()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt override name
+        if event.button() == Qt.LeftButton and self._dragging_handle:
+            self._move_handle_to_x(event.x())
+            self._dragging_handle = None
+            self.unsetCursor()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):  # noqa: N802 - Qt override name
+        if not self._dragging_handle:
+            self.unsetCursor()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):  # noqa: N802 - Qt override name
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        painter.fillRect(rect, QColor("#05070d"))
+
+        if not self.thumbnails:
+            painter.setPen(QColor("#64748b"))
+            painter.drawText(rect, Qt.AlignCenter, "設定 [ 和 ] 後可拖左右藍線微調")
+            painter.end()
+            return
+
+        thumb_count = len(self.thumbnails)
+        thumb_width = max(1, rect.width() / thumb_count)
+        for index, (_, pixmap) in enumerate(self.thumbnails):
+            target = QRect(
+                int(rect.left() + index * thumb_width),
+                rect.top(),
+                int(thumb_width) + 1,
+                rect.height(),
+            )
+            painter.drawPixmap(target, pixmap)
+
+        start_x, end_x = self._range_pixels()
+        painter.fillRect(rect.left(), rect.top(), max(0, start_x - rect.left()), rect.height(), QColor(0, 0, 0, 145))
+        painter.fillRect(end_x, rect.top(), max(0, rect.right() - end_x + 1), rect.height(), QColor(0, 0, 0, 145))
+
+        if self.range_start_ms is not None and self.range_end_ms is not None:
+            selected_rect = QRect(start_x, rect.top(), max(2, end_x - start_x), rect.height())
+            painter.setPen(QPen(QColor("#38bdf8"), 2))
+            painter.drawRect(selected_rect.adjusted(0, 1, 0, -2))
+            self._draw_handle(painter, start_x, rect, "[")
+            self._draw_handle(painter, end_x, rect, "]")
+
+        painter.end()
+
+    def set_duration(self, duration_ms: int) -> None:
+        self.duration_ms = max(0, int(duration_ms))
+        self.view_start_ms = 0
+        self.view_end_ms = self.duration_ms
+        self.update()
+
+    def set_view(self, start_ms: int, end_ms: int) -> None:
+        self.view_start_ms = max(0, int(start_ms))
+        self.view_end_ms = max(self.view_start_ms + SLIDER_STEP_MS, int(end_ms))
+        if self.duration_ms > 0:
+            self.view_end_ms = min(self.duration_ms, self.view_end_ms)
+            self.view_start_ms = min(self.view_start_ms, max(0, self.view_end_ms - SLIDER_STEP_MS))
+        self.update()
+
+    def set_thumbnails(self, thumbnails: list[tuple[int, QPixmap]]) -> None:
+        self.thumbnails = thumbnails
+        self.update()
+
+    def set_range(self, start_ms: Optional[int], end_ms: Optional[int]) -> None:
+        self.range_start_ms = start_ms
+        self.range_end_ms = end_ms
+        self.update()
+
+    def _time_to_x(self, position_ms: int) -> int:
+        if self.view_end_ms <= self.view_start_ms:
+            return self.rect().left()
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        ratio = (position_ms - self.view_start_ms) / max(1, self.view_end_ms - self.view_start_ms)
+        ratio = max(0.0, min(1.0, ratio))
+        return int(rect.left() + ratio * rect.width())
+
+    def _x_to_time(self, x: int) -> int:
+        if self.view_end_ms <= self.view_start_ms:
+            return 0
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        ratio = (x - rect.left()) / max(1, rect.width())
+        ratio = max(0.0, min(1.0, ratio))
+        return int(self.view_start_ms + ratio * (self.view_end_ms - self.view_start_ms))
+
+    def _range_pixels(self) -> tuple[int, int]:
+        if self.range_start_ms is None or self.range_end_ms is None:
+            return self.rect().left(), self.rect().right()
+        start_ms, end_ms = sorted((self.range_start_ms, self.range_end_ms))
+        return self._time_to_x(start_ms), self._time_to_x(end_ms)
+
+    def _nearest_handle(self, x: int) -> Optional[str]:
+        if self.range_start_ms is None or self.range_end_ms is None:
+            return None
+        start_x, end_x = self._range_pixels()
+        threshold = 16
+        start_distance = abs(x - start_x)
+        end_distance = abs(x - end_x)
+        if start_distance <= threshold or end_distance <= threshold:
+            return "start" if start_distance <= end_distance else "end"
+        return None
+
+    def _move_handle_to_x(self, x: int) -> None:
+        if self.range_start_ms is None or self.range_end_ms is None or self._dragging_handle is None:
+            return
+        position_ms = self._x_to_time(x)
+        start_ms = self.range_start_ms
+        end_ms = self.range_end_ms
+        if self._dragging_handle == "start":
+            start_ms = min(position_ms, end_ms - SLIDER_STEP_MS)
+            start_ms = max(0, start_ms)
+            preview_ms = start_ms
+        else:
+            end_ms = max(position_ms, start_ms + SLIDER_STEP_MS)
+            end_ms = min(self.duration_ms, end_ms)
+            preview_ms = end_ms
+        self.range_start_ms = start_ms
+        self.range_end_ms = end_ms
+        self.rangeChanged.emit(start_ms, end_ms)
+        self.handleMoved.emit(preview_ms)
+        self.update()
+
+    def _draw_handle(self, painter: QPainter, x: int, rect: QRect, label: str) -> None:
+        painter.setPen(QPen(QColor("#38bdf8"), 3))
+        painter.drawLine(x, rect.top(), x, rect.bottom())
+        handle_rect = QRect(x - 8, rect.top(), 16, 18)
+        painter.fillRect(handle_rect, QColor("#38bdf8"))
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(handle_rect, Qt.AlignCenter, label)
 
 
 class VideoDropFilter(QObject):
@@ -194,7 +350,6 @@ class VideoTimeClipper(QMainWindow):
         self.thumbnail_timer = QTimer(self)
         self.thumbnail_timer.setSingleShot(True)
         self.thumbnail_timer.timeout.connect(self._refresh_thumbnail_strip)
-        self.thumbnail_labels: list[ThumbnailLabel] = []
         self._thumbnail_pending_center_ms = 0
 
         self.drop_filter = VideoDropFilter(self)
@@ -257,21 +412,9 @@ class VideoTimeClipper(QMainWindow):
         timeline.addWidget(self.seek_slider, stretch=1)
         timeline.addWidget(self.total_time_label)
 
-        self.thumbnail_row = QHBoxLayout()
-        self.thumbnail_row.setSpacing(4)
-        for _ in range(13):
-            thumbnail = ThumbnailLabel()
-            thumbnail.clicked.connect(self.set_player_position)
-            self.thumbnail_labels.append(thumbnail)
-            self.thumbnail_row.addWidget(thumbnail, stretch=1)
-
-        self.thumbnail_slider = ClickableSlider(Qt.Horizontal)
-        self.thumbnail_slider.setObjectName("thumbnailSlider")
-        self.thumbnail_slider.setRange(0, 0)
-        self.thumbnail_slider.setSingleStep(1)
-        self.thumbnail_slider.setPageStep(5)
-        self.thumbnail_slider.setTracking(True)
-        self.thumbnail_slider.setToolTip("縮圖區間 BAR，可按住左右拉動微調")
+        self.thumbnail_strip = ThumbnailRangeStrip()
+        self.thumbnail_strip.rangeChanged.connect(self._on_thumbnail_range_changed)
+        self.thumbnail_strip.handleMoved.connect(self._on_thumbnail_handle_moved)
 
         main_button_row = QHBoxLayout()
         main_button_row.setSpacing(7)
@@ -346,8 +489,7 @@ class VideoTimeClipper(QMainWindow):
 
         bottom_layout.addWidget(self.file_label)
         bottom_layout.addLayout(timeline)
-        bottom_layout.addLayout(self.thumbnail_row)
-        bottom_layout.addWidget(self.thumbnail_slider)
+        bottom_layout.addWidget(self.thumbnail_strip)
         bottom_layout.addLayout(main_button_row)
         bottom_layout.addLayout(bottom_grid)
 
@@ -403,9 +545,6 @@ class VideoTimeClipper(QMainWindow):
         self.seek_slider.scanStarted.connect(self._on_slider_pressed)
         self.seek_slider.scanMoved.connect(self._on_slider_moved)
         self.seek_slider.scanFinished.connect(self._on_slider_released)
-        self.thumbnail_slider.scanStarted.connect(self._on_slider_pressed)
-        self.thumbnail_slider.scanMoved.connect(self._on_slider_moved)
-        self.thumbnail_slider.scanFinished.connect(self._on_slider_released)
         self.segment_list.itemSelectionChanged.connect(self.update_actions)
         self.segment_list.itemDoubleClicked.connect(self.seek_to_segment_start)
 
@@ -476,16 +615,13 @@ class VideoTimeClipper(QMainWindow):
                 font-variant-numeric: tabular-nums;
                 min-width: 72px;
             }
-            QLabel#thumbnailLabel {
+            QWidget#thumbnailStrip {
                 background: #05070d;
                 border: 1px solid #273247;
                 border-radius: 4px;
                 color: #64748b;
                 font-size: 10px;
                 font-variant-numeric: tabular-nums;
-            }
-            QLabel#thumbnailLabel:hover {
-                border-color: #60a5fa;
             }
             QLabel#outputPreview {
                 color: #dbeafe;
@@ -563,22 +699,6 @@ class VideoTimeClipper(QMainWindow):
                 margin: -6px 0;
                 border-radius: 9px;
             }
-            QSlider#thumbnailSlider::groove:horizontal {
-                height: 5px;
-                background: #1f2937;
-                border-radius: 3px;
-            }
-            QSlider#thumbnailSlider::sub-page:horizontal {
-                background: #38bdf8;
-                border-radius: 3px;
-            }
-            QSlider#thumbnailSlider::handle:horizontal {
-                background: #e0f2fe;
-                border: 1px solid #38bdf8;
-                width: 14px;
-                margin: -5px 0;
-                border-radius: 7px;
-            }
             """
         )
 
@@ -613,9 +733,6 @@ class VideoTimeClipper(QMainWindow):
         self.seek_slider.setRange(0, 0)
         self.seek_slider.setSingleStep(1)
         self.seek_slider.setPageStep(5)
-        self.thumbnail_slider.setRange(0, 0)
-        self.thumbnail_slider.setSingleStep(1)
-        self.thumbnail_slider.setPageStep(5)
         self.current_time_label.setText("0:00")
         self.total_time_label.setText("0:00")
         self._refresh_capture_labels()
@@ -640,24 +757,21 @@ class VideoTimeClipper(QMainWindow):
     def _set_slider_duration(self, duration_ms: int) -> None:
         self.duration_ms = max(0, int(duration_ms))
         slider_max = self._duration_to_slider_max(self.duration_ms)
-        for slider in (self.seek_slider, self.thumbnail_slider):
-            slider.setRange(0, slider_max)
-            slider.setSingleStep(1)
-            slider.setPageStep(5)
+        self.seek_slider.setRange(0, slider_max)
+        self.seek_slider.setSingleStep(1)
+        self.seek_slider.setPageStep(5)
         self.total_time_label.setText(format_time(self.duration_ms))
+        self.thumbnail_strip.set_duration(self.duration_ms)
 
     def _clear_thumbnail_strip(self) -> None:
-        for thumbnail in self.thumbnail_labels:
-            thumbnail.position_ms = 0
-            thumbnail.clear()
-            thumbnail.setText("--")
-            thumbnail.setToolTip("")
+        self.thumbnail_strip.set_thumbnails([])
+        self.thumbnail_strip.set_range(None, None)
 
     def _schedule_thumbnail_refresh(self, center_ms: Optional[int] = None) -> None:
-        if not self.video_path or not self.thumbnail_labels:
+        if not self.video_path:
             return
         self._thumbnail_pending_center_ms = self.current_position_ms() if center_ms is None else max(0, int(center_ms))
-        self.thumbnail_timer.start(90)
+        self.thumbnail_timer.start(120)
 
     def _refresh_thumbnail_strip(self) -> None:
         if not self.video_path or cv2 is None:
@@ -667,34 +781,51 @@ class VideoTimeClipper(QMainWindow):
         if not capture.isOpened():
             return
 
-        center_ms = max(0, min(self.duration_ms, int(self._thumbnail_pending_center_ms)))
-        half_count = len(self.thumbnail_labels) // 2
-        for index, thumbnail in enumerate(self.thumbnail_labels):
-            offset = index - half_count
-            position_ms = center_ms + (offset * SLIDER_STEP_MS)
-            position_ms = max(0, min(self.duration_ms, position_ms))
-            thumbnail.position_ms = position_ms
-            thumbnail.setToolTip(format_time(position_ms))
+        view_start_ms, view_end_ms = self._thumbnail_view_window()
+        self.thumbnail_strip.set_view(view_start_ms, view_end_ms)
+        thumbnail_count = 15
+        thumbnails: list[tuple[int, QPixmap]] = []
+        for index in range(thumbnail_count):
+            if thumbnail_count == 1 or view_end_ms <= view_start_ms:
+                position_ms = view_start_ms
+            else:
+                position_ms = int(view_start_ms + ((view_end_ms - view_start_ms) * index) / (thumbnail_count - 1))
 
             capture.set(cv2.CAP_PROP_POS_MSEC, position_ms)
             ok, frame = capture.read()
             if not ok:
-                thumbnail.clear()
-                thumbnail.setText(format_time(position_ms))
                 continue
 
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             height, width, channels = rgb_frame.shape
             bytes_per_line = channels * width
             image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
-            pixmap = QPixmap.fromImage(image).scaled(
-                thumbnail.size(),
-                Qt.KeepAspectRatioByExpanding,
-                Qt.SmoothTransformation,
-            )
-            thumbnail.setPixmap(pixmap)
+            thumbnails.append((position_ms, QPixmap.fromImage(image)))
 
         capture.release()
+        self.thumbnail_strip.set_thumbnails(thumbnails)
+        self.thumbnail_strip.set_range(self.pending_start_ms, self.pending_end_ms)
+
+    def _thumbnail_view_window(self) -> tuple[int, int]:
+        if self.duration_ms <= 0:
+            return 0, 0
+
+        if self.pending_start_ms is not None and self.pending_end_ms is not None:
+            start_ms, end_ms = sorted((self.pending_start_ms, self.pending_end_ms))
+            selected_duration = max(SLIDER_STEP_MS, end_ms - start_ms)
+            window_ms = max(60_000, selected_duration * 3)
+            center_ms = (start_ms + end_ms) // 2
+        else:
+            window_ms = min(max(60_000, self.duration_ms // 12), self.duration_ms)
+            center_ms = self.current_position_ms()
+
+        window_ms = min(window_ms, self.duration_ms)
+        view_start = max(0, center_ms - window_ms // 2)
+        view_end = view_start + window_ms
+        if view_end > self.duration_ms:
+            view_end = self.duration_ms
+            view_start = max(0, view_end - window_ms)
+        return int(view_start), int(view_end)
 
     def _is_currently_playing(self) -> bool:
         if self._fallback_active:
@@ -712,11 +843,11 @@ class VideoTimeClipper(QMainWindow):
         if self._fallback_active:
             self._resume_fallback_playback()
 
-    def set_player_position(self, position_ms: int) -> None:
+    def set_player_position(self, position_ms: int, refresh_thumbnails: bool = True) -> None:
         upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
         position_ms = max(0, min(int(position_ms), upper_bound))
         if self._fallback_active:
-            self._seek_fallback(position_ms)
+            self._seek_fallback(position_ms, refresh_thumbnails=refresh_thumbnails)
             return
         self._update_position_labels(position_ms)
 
@@ -776,7 +907,7 @@ class VideoTimeClipper(QMainWindow):
         interval_ms = max(15, min(80, int(1000 / self._fallback_fps)))
         self.fallback_timer.start(interval_ms)
 
-    def _seek_fallback(self, position_ms: int) -> None:
+    def _seek_fallback(self, position_ms: int, refresh_thumbnails: bool = True) -> None:
         if not self._fallback_capture:
             return
         was_playing = self._fallback_playing
@@ -784,7 +915,8 @@ class VideoTimeClipper(QMainWindow):
         self._fallback_capture.set(cv2.CAP_PROP_POS_MSEC, position_ms)
         self._fallback_position_ms = position_ms
         self._render_fallback_frame()
-        self._schedule_thumbnail_refresh(position_ms)
+        if refresh_thumbnails:
+            self._schedule_thumbnail_refresh(position_ms)
         if was_playing:
             interval_ms = max(15, min(80, int(1000 / self._fallback_fps)))
             self.fallback_timer.start(interval_ms)
@@ -850,6 +982,8 @@ class VideoTimeClipper(QMainWindow):
             return
         self.pending_start_ms = self.current_position_ms()
         self._refresh_capture_labels()
+        self.thumbnail_strip.set_range(self.pending_start_ms, self.pending_end_ms)
+        self._schedule_thumbnail_refresh(self.pending_start_ms)
         self.status_label.setText(f"[ 左邊開頭：{format_time(self.pending_start_ms)}")
         self.update_actions()
 
@@ -858,6 +992,8 @@ class VideoTimeClipper(QMainWindow):
             return
         self.pending_end_ms = self.current_position_ms()
         self._refresh_capture_labels()
+        self.thumbnail_strip.set_range(self.pending_start_ms, self.pending_end_ms)
+        self._schedule_thumbnail_refresh(self.pending_end_ms)
         self.status_label.setText(f"] 右邊結尾：{format_time(self.pending_end_ms)}")
         self.update_actions()
 
@@ -875,6 +1011,8 @@ class VideoTimeClipper(QMainWindow):
         self.pending_start_ms = None
         self.pending_end_ms = None
         self._refresh_capture_labels()
+        self.thumbnail_strip.set_range(None, None)
+        self._schedule_thumbnail_refresh()
         self.status_label.setText(f"已加入：{segment.label()}")
         self.update_actions()
 
@@ -925,18 +1063,26 @@ class VideoTimeClipper(QMainWindow):
         self._pause_for_slider_scan()
 
     def _set_slider_value_without_feedback(self, slider_value: int) -> None:
-        for slider in (self.seek_slider, self.thumbnail_slider):
-            if slider.value() == slider_value:
-                continue
-            slider.blockSignals(True)
-            slider.setValue(slider_value)
-            slider.blockSignals(False)
+        if self.seek_slider.value() == slider_value:
+            return
+        self.seek_slider.blockSignals(True)
+        self.seek_slider.setValue(slider_value)
+        self.seek_slider.blockSignals(False)
 
     def _on_slider_moved(self, slider_value: int) -> None:
         self._set_slider_value_without_feedback(slider_value)
         target_ms = self._slider_value_to_ms(slider_value)
         self.set_player_position(target_ms)
         self.current_time_label.setText(format_time(target_ms))
+
+    def _on_thumbnail_range_changed(self, start_ms: int, end_ms: int) -> None:
+        self.pending_start_ms = start_ms
+        self.pending_end_ms = end_ms
+        self._refresh_capture_labels()
+        self.update_actions()
+
+    def _on_thumbnail_handle_moved(self, position_ms: int) -> None:
+        self.set_player_position(position_ms, refresh_thumbnails=False)
 
     def _on_slider_released(self, slider_value: Optional[int] = None) -> None:
         self._slider_is_pressed = False
