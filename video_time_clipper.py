@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import ctypes
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -38,6 +39,11 @@ try:
 except ImportError:  # pragma: no cover - only used on machines without OpenCV.
     cv2 = None
 
+try:
+    import av
+except ImportError:  # pragma: no cover - only used on machines without PyAV.
+    av = None
+
 if cv2 is not None:
     cv2.setNumThreads(1)
 
@@ -47,12 +53,157 @@ TEXT_FILTER = "文字檔案 (*.txt);;所有檔案 (*.*)"
 DEFAULT_OUTPUT_LIST_PATH = r"C:\Users\User\Documents\清單.txt"
 WINDOWS_APP_ID = "Star.VideoTimeClipper"
 SLIDER_STEP_MS = 1000
-PLAYBACK_MAX_FPS = 12.0
+PLAYBACK_MAX_FPS = 18.0
 SEEK_DEBOUNCE_MS = 45
 THUMBNAIL_COUNT = 9
 THUMBNAIL_MAX_WIDTH = 180
 THUMBNAIL_MAX_HEIGHT = 76
 SEEK_SLIDER_HIT_HEIGHT = 42
+VIDEO_READ_LOCK = threading.RLock()
+
+
+class AvVideoReader:
+    def __init__(self, path: str) -> None:
+        if av is None:
+            raise RuntimeError("PyAV is not available")
+        self.path = path
+        self.container = av.open(path)
+        self.stream = self.container.streams.video[0]
+        self.time_base = float(self.stream.time_base or 0) or (1 / 30)
+        self.fps = self._read_fps()
+        self.frame_count = int(self.stream.frames or 0)
+        self.duration_ms = self._read_duration_ms()
+        self.last_position_ms = 0
+        self._packets = self.container.demux(self.stream)
+
+    def _read_fps(self) -> float:
+        rate = self.stream.average_rate or self.stream.base_rate or self.stream.guessed_rate
+        if rate:
+            fps = float(rate)
+            if 1 <= fps <= 240:
+                return fps
+        return 30.0
+
+    def _read_duration_ms(self) -> int:
+        if self.stream.duration:
+            return max(0, int(float(self.stream.duration) * self.time_base * 1000))
+        if self.container.duration:
+            return max(0, int(self.container.duration / 1000))
+        if self.frame_count > 0:
+            return max(0, int((self.frame_count / self.fps) * 1000))
+        return 0
+
+    def read(self):
+        for packet in self._packets:
+            for frame in packet.decode():
+                self._remember_position(frame)
+                return True, frame.to_ndarray(format="bgr24")
+        return False, None
+
+    def seek_read(self, position_ms: int):
+        position_ms = max(0, int(position_ms))
+        target_pts = int((position_ms / 1000) / self.time_base)
+        self.container.seek(target_pts, any_frame=False, backward=True, stream=self.stream)
+        self._packets = self.container.demux(self.stream)
+        self.last_position_ms = position_ms
+
+        fallback_frame = None
+        max_decode = max(8, min(120, int(self.fps * 4)))
+        for _ in range(max_decode):
+            ok, frame = self.read()
+            if not ok:
+                break
+            fallback_frame = frame
+            if self.last_position_ms + (1000 / self.fps) >= position_ms:
+                return True, frame
+        if fallback_frame is not None:
+            return True, fallback_frame
+        return False, None
+
+    def _remember_position(self, frame) -> None:
+        if frame.pts is not None:
+            self.last_position_ms = max(0, int(frame.pts * self.time_base * 1000))
+        else:
+            self.last_position_ms += int(1000 / self.fps)
+
+    def release(self) -> None:
+        self.container.close()
+
+
+class CvVideoReader:
+    def __init__(self, path: str) -> None:
+        if cv2 is None:
+            raise RuntimeError("OpenCV is not available")
+        self.path = path
+        self.capture = None
+        self.backend_name = "OpenCV"
+        self._open_capture(path)
+        self.fps = float(self.capture.get(cv2.CAP_PROP_FPS) or 0)
+        if self.fps <= 1 or self.fps > 240:
+            self.fps = 30.0
+        self.frame_count = int(self.capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.duration_ms = max(0, int((self.frame_count / self.fps) * 1000)) if self.frame_count > 0 else 0
+        self.last_position_ms = 0
+
+    def _open_capture(self, path: str) -> None:
+        backends = []
+        if hasattr(cv2, "CAP_FFMPEG"):
+            backends.append(("OpenCV FFmpeg", cv2.CAP_FFMPEG))
+        if hasattr(cv2, "CAP_MSMF"):
+            backends.append(("OpenCV MSMF", cv2.CAP_MSMF))
+        backends.append(("OpenCV Auto", None))
+
+        for name, backend in backends:
+            capture = cv2.VideoCapture(path) if backend is None else cv2.VideoCapture(path, backend)
+            if capture.isOpened():
+                try:
+                    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
+                self.capture = capture
+                self.backend_name = name
+                return
+            capture.release()
+        raise RuntimeError("OpenCV cannot open video")
+
+    def read(self):
+        ok, frame = self.capture.read()
+        if ok:
+            self.last_position_ms = int(self.capture.get(cv2.CAP_PROP_POS_MSEC) or 0)
+            if self.last_position_ms <= 0:
+                frame_index = float(self.capture.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                self.last_position_ms = int((frame_index / self.fps) * 1000)
+        return ok, frame
+
+    def seek_read(self, position_ms: int):
+        self.capture.set(cv2.CAP_PROP_POS_MSEC, max(0, int(position_ms)))
+        ok, frame = self.read()
+        if not ok:
+            self.last_position_ms = max(0, int(position_ms))
+        return ok, frame
+
+    def release(self) -> None:
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
+
+
+def open_video_reader(path: str):
+    errors = []
+    if av is not None:
+        try:
+            return AvVideoReader(path), "PyAV"
+        except Exception as exc:
+            errors.append(f"PyAV: {exc}")
+
+    if cv2 is not None:
+        try:
+            reader = CvVideoReader(path)
+            return reader, reader.backend_name
+        except Exception as exc:
+            errors.append(f"OpenCV: {exc}")
+
+    raise RuntimeError("; ".join(errors) or "No video reader is available")
 
 
 def resize_frame_to_fit(frame, max_width: int, max_height: int):
@@ -75,7 +226,12 @@ def resize_frame_to_cover(frame, target_width: int, target_height: int):
     scale = max(target_width / width, target_height / height)
     resized_width = max(1, int(width * scale))
     resized_height = max(1, int(height * scale))
-    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+    if scale < 0.999:
+        interpolation = cv2.INTER_AREA
+    elif scale > 1.001:
+        interpolation = cv2.INTER_CUBIC
+    else:
+        interpolation = cv2.INTER_LINEAR
     resized = cv2.resize(frame, (resized_width, resized_height), interpolation=interpolation)
 
     left = max(0, (resized_width - target_width) // 2)
@@ -345,8 +501,10 @@ class ThumbnailWorker(QObject):
             self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
             return
 
-        capture = cv2.VideoCapture(self.video_path)
-        if not capture.isOpened():
+        try:
+            with VIDEO_READ_LOCK:
+                reader, _ = open_video_reader(self.video_path)
+        except Exception:
             self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
             return
 
@@ -362,8 +520,8 @@ class ThumbnailWorker(QObject):
                         + ((self.view_end_ms - self.view_start_ms) * index) / (THUMBNAIL_COUNT - 1)
                     )
 
-                capture.set(cv2.CAP_PROP_POS_MSEC, position_ms)
-                ok, frame = capture.read()
+                with VIDEO_READ_LOCK:
+                    ok, frame = reader.seek_read(position_ms)
                 if not ok:
                     continue
 
@@ -374,7 +532,8 @@ class ThumbnailWorker(QObject):
                 image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
                 thumbnails.append((position_ms, image))
         finally:
-            capture.release()
+            with VIDEO_READ_LOCK:
+                reader.release()
 
         self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
 
@@ -449,6 +608,7 @@ class VideoTimeClipper(QMainWindow):
         self._fallback_active = False
         self._fallback_playing = False
         self._fallback_capture = None
+        self._fallback_backend = ""
         self._fallback_fps = 30.0
         self._fallback_position_ms = 0
 
@@ -1068,26 +1228,29 @@ class VideoTimeClipper(QMainWindow):
             self.status_label.setText(f"{reason}，但目前 Python 沒有 OpenCV 可用。")
             return
 
-        capture = cv2.VideoCapture(self.video_path)
-        if not capture.isOpened():
-            self.status_label.setText(f"{reason}，但相容模式也無法開啟這支影片。")
+        try:
+            with VIDEO_READ_LOCK:
+                capture, backend_name = open_video_reader(self.video_path)
+        except Exception as exc:
+            self.status_label.setText(f"{reason}，但相容模式也無法開啟這支影片：{exc}")
             return
 
         self._fallback_capture = capture
+        self._fallback_backend = backend_name
         self._fallback_active = True
         self._fallback_playing = True
         self._fallback_position_ms = 0
 
-        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+        fps = float(getattr(capture, "fps", 0) or 0)
         if fps <= 1 or fps > 240:
             fps = 30.0
         self._fallback_fps = fps
 
-        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if frame_count > 0 and self.duration_ms <= 0:
-            self._set_slider_duration(int((frame_count / fps) * 1000))
+        duration_ms = int(getattr(capture, "duration_ms", 0) or 0)
+        if duration_ms > 0 and self.duration_ms <= 0:
+            self._set_slider_duration(duration_ms)
 
-        self.status_label.setText(reason)
+        self.status_label.setText(f"{reason}（{backend_name}）")
         self._set_play_button_state(is_playing=True)
         self._render_fallback_frame()
         self.fallback_timer.start(self._playback_interval_ms())
@@ -1095,8 +1258,10 @@ class VideoTimeClipper(QMainWindow):
     def _stop_fallback_playback(self) -> None:
         self.fallback_timer.stop()
         if self._fallback_capture is not None:
-            self._fallback_capture.release()
+            with VIDEO_READ_LOCK:
+                self._fallback_capture.release()
         self._fallback_capture = None
+        self._fallback_backend = ""
         self._fallback_active = False
         self._fallback_playing = False
         self.frame_label.clear()
@@ -1119,9 +1284,25 @@ class VideoTimeClipper(QMainWindow):
             return
         was_playing = self._fallback_playing
         self.fallback_timer.stop()
-        self._fallback_capture.set(cv2.CAP_PROP_POS_MSEC, position_ms)
-        self._fallback_position_ms = position_ms
-        self._render_fallback_frame()
+        try:
+            with VIDEO_READ_LOCK:
+                ok, frame = self._fallback_capture.seek_read(position_ms)
+                current_ms = int(getattr(self._fallback_capture, "last_position_ms", position_ms) or position_ms)
+        except Exception as exc:
+            self._fallback_position_ms = position_ms
+            self._update_position_labels(position_ms)
+            self.status_label.setText(f"跳轉時解碼失敗：{exc}")
+            ok = False
+            frame = None
+            current_ms = position_ms
+
+        if ok and frame is not None:
+            self._fallback_position_ms = max(0, current_ms)
+            self._show_fallback_frame(frame)
+            self._update_position_labels(self._fallback_position_ms)
+        else:
+            self._fallback_position_ms = position_ms
+            self._update_position_labels(position_ms)
         if refresh_thumbnails:
             self._schedule_thumbnail_refresh(position_ms)
         if was_playing:
@@ -1134,16 +1315,30 @@ class VideoTimeClipper(QMainWindow):
     def _render_fallback_frame(self) -> None:
         if not self._fallback_capture:
             return
-        ok, frame = self._fallback_capture.read()
+        if not VIDEO_READ_LOCK.acquire(blocking=False):
+            return
+        try:
+            ok, frame = self._fallback_capture.read()
+            position_ms = int(getattr(self._fallback_capture, "last_position_ms", 0) or 0)
+        except Exception as exc:
+            ok = False
+            frame = None
+            position_ms = self._fallback_position_ms
+            error_message = str(exc)
+        else:
+            error_message = ""
+        finally:
+            VIDEO_READ_LOCK.release()
+
+        if error_message:
+            self._pause_fallback_playback()
+            self.status_label.setText(f"影片解碼失敗：{error_message}")
+            return
         if not ok:
             self._pause_fallback_playback()
             self.status_label.setText("影片播放到結尾")
             return
 
-        position_ms = int(self._fallback_capture.get(cv2.CAP_PROP_POS_MSEC) or 0)
-        if position_ms <= 0:
-            frame_index = float(self._fallback_capture.get(cv2.CAP_PROP_POS_FRAMES) or 0)
-            position_ms = int((frame_index / self._fallback_fps) * 1000)
         self._fallback_position_ms = max(0, position_ms)
         self._show_fallback_frame(frame)
         self._update_position_labels(self._fallback_position_ms)
