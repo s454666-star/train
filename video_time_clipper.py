@@ -406,6 +406,9 @@ class ThumbnailRangeStrip(QWidget):
         self.range_start_ms: Optional[int] = None
         self.range_end_ms: Optional[int] = None
         self._dragging_handle: Optional[str] = None
+        self._drag_anchor_x = 0
+        self._drag_anchor_start_ms = 0
+        self._drag_anchor_end_ms = 0
 
     def mousePressEvent(self, event):  # noqa: N802 - Qt override name
         if event.button() == Qt.LeftButton:
@@ -413,6 +416,13 @@ class ThumbnailRangeStrip(QWidget):
             if handle is not None:
                 self._dragging_handle = handle
                 self._move_handle_to_x(event.x())
+                event.accept()
+                return
+            if self._is_inside_range(event.x()):
+                self._dragging_handle = "range"
+                self._drag_anchor_x = event.x()
+                self._drag_anchor_start_ms, self._drag_anchor_end_ms = self._normalized_range()
+                self.setCursor(Qt.SizeAllCursor)
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -425,6 +435,8 @@ class ThumbnailRangeStrip(QWidget):
         hover_handle = self._nearest_handle(event.x())
         if hover_handle:
             self.setCursor(Qt.SizeHorCursor)
+        elif self._is_inside_range(event.x()):
+            self.setCursor(Qt.SizeAllCursor)
         else:
             self.unsetCursor()
         super().mouseMoveEvent(event)
@@ -521,8 +533,19 @@ class ThumbnailRangeStrip(QWidget):
     def _range_pixels(self) -> tuple[int, int]:
         if self.range_start_ms is None or self.range_end_ms is None:
             return self.rect().left(), self.rect().right()
-        start_ms, end_ms = sorted((self.range_start_ms, self.range_end_ms))
+        start_ms, end_ms = self._normalized_range()
         return self._time_to_x(start_ms), self._time_to_x(end_ms)
+
+    def _normalized_range(self) -> tuple[int, int]:
+        if self.range_start_ms is None or self.range_end_ms is None:
+            return 0, 0
+        return tuple(sorted((int(self.range_start_ms), int(self.range_end_ms))))
+
+    def _is_inside_range(self, x: int) -> bool:
+        if self.range_start_ms is None or self.range_end_ms is None:
+            return False
+        start_x, end_x = self._range_pixels()
+        return start_x + THUMBNAIL_HANDLE_THRESHOLD < x < end_x - THUMBNAIL_HANDLE_THRESHOLD
 
     def _nearest_handle(self, x: int) -> Optional[str]:
         if self.range_start_ms is None or self.range_end_ms is None:
@@ -539,9 +562,10 @@ class ThumbnailRangeStrip(QWidget):
         if self.range_start_ms is None or self.range_end_ms is None or self._dragging_handle is None:
             return
         position_ms = self._x_to_time(x)
-        start_ms = self.range_start_ms
-        end_ms = self.range_end_ms
-        if self._dragging_handle == "start":
+        start_ms, end_ms = self._normalized_range()
+        if self._dragging_handle == "range":
+            start_ms, end_ms, preview_ms = self._moved_range_values(x)
+        elif self._dragging_handle == "start":
             start_ms = min(position_ms, end_ms - SLIDER_STEP_MS)
             start_ms = max(0, start_ms)
             preview_ms = start_ms
@@ -554,6 +578,17 @@ class ThumbnailRangeStrip(QWidget):
         self.rangeChanged.emit(start_ms, end_ms)
         self.handleMoved.emit(preview_ms)
         self.update()
+
+    def _moved_range_values(self, x: int) -> tuple[int, int, int]:
+        range_duration = max(SLIDER_STEP_MS, self._drag_anchor_end_ms - self._drag_anchor_start_ms)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        view_duration = max(1, self.view_end_ms - self.view_start_ms)
+        delta_ms = int(((x - self._drag_anchor_x) / max(1, rect.width())) * view_duration)
+        upper_bound = self.duration_ms if self.duration_ms > 0 else self.view_end_ms
+        max_start = max(0, upper_bound - range_duration)
+        start_ms = max(0, min(max_start, self._drag_anchor_start_ms + delta_ms))
+        end_ms = start_ms + range_duration
+        return int(start_ms), int(end_ms), int(start_ms)
 
     def _draw_handle(self, painter: QPainter, x: int, rect: QRect, label: str) -> None:
         painter.setPen(QPen(QColor("#38bdf8"), 3))
