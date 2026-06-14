@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import sys
 import ctypes
+import faulthandler
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -53,13 +55,31 @@ TEXT_FILTER = "文字檔案 (*.txt);;所有檔案 (*.*)"
 DEFAULT_OUTPUT_LIST_PATH = r"C:\Users\User\Documents\清單.txt"
 WINDOWS_APP_ID = "Star.VideoTimeClipper"
 SLIDER_STEP_MS = 1000
-PLAYBACK_MAX_FPS = 18.0
+PLAYBACK_MAX_FPS = 24.0
 SEEK_DEBOUNCE_MS = 45
 THUMBNAIL_COUNT = 9
 THUMBNAIL_MAX_WIDTH = 180
 THUMBNAIL_MAX_HEIGHT = 76
 SEEK_SLIDER_HIT_HEIGHT = 42
 VIDEO_READ_LOCK = threading.RLock()
+PLAYBACK_CATCHUP_FRAME_LIMIT = 8
+PLAYBACK_SEEK_CATCHUP_MS = 1200
+_CRASH_LOG_HANDLE = None
+
+
+def enable_crash_logging() -> None:
+    global _CRASH_LOG_HANDLE
+    if _CRASH_LOG_HANDLE is not None:
+        return
+    try:
+        base_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "CodexTools" / "VideoTimeClipper"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        _CRASH_LOG_HANDLE = open(base_dir / "crash.log", "a", encoding="utf-8")
+        _CRASH_LOG_HANDLE.write(f"\n--- start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        _CRASH_LOG_HANDLE.flush()
+        faulthandler.enable(_CRASH_LOG_HANDLE, all_threads=True)
+    except Exception:
+        _CRASH_LOG_HANDLE = None
 
 
 class AvVideoReader:
@@ -147,14 +167,11 @@ class CvVideoReader:
 
     def _open_capture(self, path: str) -> None:
         backends = []
-        if hasattr(cv2, "CAP_FFMPEG"):
-            backends.append(("OpenCV FFmpeg", cv2.CAP_FFMPEG))
         if hasattr(cv2, "CAP_MSMF"):
             backends.append(("OpenCV MSMF", cv2.CAP_MSMF))
-        backends.append(("OpenCV Auto", None))
 
         for name, backend in backends:
-            capture = cv2.VideoCapture(path) if backend is None else cv2.VideoCapture(path, backend)
+            capture = cv2.VideoCapture(path, backend)
             if capture.isOpened():
                 try:
                     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -164,7 +181,7 @@ class CvVideoReader:
                 self.backend_name = name
                 return
             capture.release()
-        raise RuntimeError("OpenCV cannot open video")
+        raise RuntimeError("OpenCV MSMF cannot open video")
 
     def read(self):
         ok, frame = self.capture.read()
@@ -229,7 +246,7 @@ def resize_frame_to_cover(frame, target_width: int, target_height: int):
     if scale < 0.999:
         interpolation = cv2.INTER_AREA
     elif scale > 1.001:
-        interpolation = cv2.INTER_CUBIC
+        interpolation = getattr(cv2, "INTER_LINEAR_EXACT", cv2.INTER_LINEAR)
     else:
         interpolation = cv2.INTER_LINEAR
     resized = cv2.resize(frame, (resized_width, resized_height), interpolation=interpolation)
@@ -611,6 +628,8 @@ class VideoTimeClipper(QMainWindow):
         self._fallback_backend = ""
         self._fallback_fps = 30.0
         self._fallback_position_ms = 0
+        self._playback_clock_started_at = 0.0
+        self._playback_clock_position_ms = 0
 
         self.fallback_timer = QTimer(self)
         self.fallback_timer.timeout.connect(self._render_fallback_frame)
@@ -1252,7 +1271,9 @@ class VideoTimeClipper(QMainWindow):
 
         self.status_label.setText(f"{reason}（{backend_name}）")
         self._set_play_button_state(is_playing=True)
+        self._sync_playback_clock()
         self._render_fallback_frame()
+        self._sync_playback_clock()
         self.fallback_timer.start(self._playback_interval_ms())
 
     def _stop_fallback_playback(self) -> None:
@@ -1270,12 +1291,14 @@ class VideoTimeClipper(QMainWindow):
     def _pause_fallback_playback(self) -> None:
         self.fallback_timer.stop()
         self._fallback_playing = False
+        self._sync_playback_clock()
         self._set_play_button_state(is_playing=False)
 
     def _resume_fallback_playback(self) -> None:
         if not self._fallback_capture:
             return
         self._fallback_playing = True
+        self._sync_playback_clock()
         self._set_play_button_state(is_playing=True)
         self.fallback_timer.start(self._playback_interval_ms())
 
@@ -1306,27 +1329,40 @@ class VideoTimeClipper(QMainWindow):
         if refresh_thumbnails:
             self._schedule_thumbnail_refresh(position_ms)
         if was_playing:
+            self._sync_playback_clock()
             self.fallback_timer.start(self._playback_interval_ms())
 
     def _playback_interval_ms(self) -> int:
         fps = min(max(self._fallback_fps, 1.0), PLAYBACK_MAX_FPS)
-        return max(45, int(1000 / fps))
+        return max(30, int(1000 / fps))
+
+    def _sync_playback_clock(self) -> None:
+        self._playback_clock_position_ms = int(self._fallback_position_ms)
+        self._playback_clock_started_at = time.perf_counter()
+
+    def _playback_target_position_ms(self) -> int:
+        if not self._fallback_playing or self._playback_clock_started_at <= 0:
+            return int(self._fallback_position_ms)
+        elapsed_ms = int((time.perf_counter() - self._playback_clock_started_at) * 1000)
+        target_ms = self._playback_clock_position_ms + max(0, elapsed_ms)
+        if self.duration_ms > 0:
+            target_ms = min(target_ms, self.duration_ms)
+        return max(0, target_ms)
 
     def _render_fallback_frame(self) -> None:
         if not self._fallback_capture:
             return
         if not VIDEO_READ_LOCK.acquire(blocking=False):
             return
+        error_message = ""
         try:
-            ok, frame = self._fallback_capture.read()
-            position_ms = int(getattr(self._fallback_capture, "last_position_ms", 0) or 0)
+            target_ms = self._playback_target_position_ms()
+            ok, frame, position_ms = self._read_playback_frame_for_target(target_ms)
         except Exception as exc:
             ok = False
             frame = None
             position_ms = self._fallback_position_ms
             error_message = str(exc)
-        else:
-            error_message = ""
         finally:
             VIDEO_READ_LOCK.release()
 
@@ -1342,6 +1378,34 @@ class VideoTimeClipper(QMainWindow):
         self._fallback_position_ms = max(0, position_ms)
         self._show_fallback_frame(frame)
         self._update_position_labels(self._fallback_position_ms)
+
+    def _read_playback_frame_for_target(self, target_ms: int):
+        if (
+            self.duration_ms > 0
+            and target_ms >= self.duration_ms
+            and self._fallback_position_ms >= self.duration_ms - 500
+        ):
+            return False, None, self.duration_ms
+
+        if target_ms - self._fallback_position_ms > PLAYBACK_SEEK_CATCHUP_MS:
+            ok, frame = self._fallback_capture.seek_read(target_ms)
+            position_ms = int(getattr(self._fallback_capture, "last_position_ms", 0) or 0)
+            return ok, frame, position_ms
+
+        frame = None
+        ok = False
+        position_ms = self._fallback_position_ms
+        frame_margin_ms = max(12, int(500 / max(self._fallback_fps, 1.0)))
+        for _ in range(PLAYBACK_CATCHUP_FRAME_LIMIT):
+            ok, next_frame = self._fallback_capture.read()
+            if not ok:
+                break
+            frame = next_frame
+            position_ms = int(getattr(self._fallback_capture, "last_position_ms", position_ms) or position_ms)
+            if position_ms + frame_margin_ms >= target_ms:
+                break
+
+        return ok and frame is not None, frame, position_ms
 
     def _show_fallback_frame(self, frame) -> None:
         label_size = self.frame_label.size()
@@ -1586,6 +1650,7 @@ class VideoTimeClipper(QMainWindow):
 
 def main() -> int:
     set_windows_app_id()
+    enable_crash_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("影片時間擷取工具")
     app.setApplicationDisplayName("影片時間擷取工具")
