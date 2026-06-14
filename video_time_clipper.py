@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QEvent, QObject, QRect, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import QEvent, QObject, QRect, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
@@ -36,9 +36,29 @@ try:
 except ImportError:  # pragma: no cover - only used on machines without OpenCV.
     cv2 = None
 
+if cv2 is not None:
+    cv2.setNumThreads(1)
+
 
 VIDEO_FILTER = "影片檔案 (*.mp4 *.mkv *.mov *.avi *.wmv *.m4v);;所有檔案 (*.*)"
 SLIDER_STEP_MS = 1000
+PLAYBACK_MAX_FPS = 12.0
+SEEK_DEBOUNCE_MS = 45
+THUMBNAIL_COUNT = 9
+THUMBNAIL_MAX_WIDTH = 180
+THUMBNAIL_MAX_HEIGHT = 76
+
+
+def resize_frame_to_fit(frame, max_width: int, max_height: int):
+    height, width = frame.shape[:2]
+    if width <= 0 or height <= 0 or max_width <= 0 or max_height <= 0:
+        return frame
+    scale = min(max_width / width, max_height / height, 1.0)
+    if scale >= 0.999:
+        return frame
+    target_width = max(1, int(width * scale))
+    target_height = max(1, int(height * scale))
+    return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
 @dataclass(frozen=True)
@@ -281,6 +301,56 @@ class ThumbnailRangeStrip(QWidget):
         painter.drawText(handle_rect, Qt.AlignCenter, label)
 
 
+class ThumbnailWorker(QObject):
+    finished = pyqtSignal(int, int, int, list)
+
+    def __init__(self, request_id: int, video_path: str, view_start_ms: int, view_end_ms: int) -> None:
+        super().__init__()
+        self.request_id = request_id
+        self.video_path = video_path
+        self.view_start_ms = view_start_ms
+        self.view_end_ms = view_end_ms
+
+    def run(self) -> None:
+        thumbnails: list[tuple[int, QImage]] = []
+        if cv2 is None:
+            self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
+            return
+
+        capture = cv2.VideoCapture(self.video_path)
+        if not capture.isOpened():
+            self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
+            return
+
+        try:
+            for index in range(THUMBNAIL_COUNT):
+                if QThread.currentThread().isInterruptionRequested():
+                    break
+                if THUMBNAIL_COUNT == 1 or self.view_end_ms <= self.view_start_ms:
+                    position_ms = self.view_start_ms
+                else:
+                    position_ms = int(
+                        self.view_start_ms
+                        + ((self.view_end_ms - self.view_start_ms) * index) / (THUMBNAIL_COUNT - 1)
+                    )
+
+                capture.set(cv2.CAP_PROP_POS_MSEC, position_ms)
+                ok, frame = capture.read()
+                if not ok:
+                    continue
+
+                frame = resize_frame_to_fit(frame, THUMBNAIL_MAX_WIDTH, THUMBNAIL_MAX_HEIGHT)
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                height, width, channels = rgb_frame.shape
+                bytes_per_line = channels * width
+                image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+                thumbnails.append((position_ms, image))
+        finally:
+            capture.release()
+
+        self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
+
+
 class VideoDropFilter(QObject):
     dropped = pyqtSignal(str)
 
@@ -347,10 +417,20 @@ class VideoTimeClipper(QMainWindow):
 
         self.fallback_timer = QTimer(self)
         self.fallback_timer.timeout.connect(self._render_fallback_frame)
+        self.seek_timer = QTimer(self)
+        self.seek_timer.setSingleShot(True)
+        self.seek_timer.timeout.connect(self._apply_pending_seek)
+        self._pending_seek_ms: Optional[int] = None
+        self._pending_seek_refresh_thumbnails = False
         self.thumbnail_timer = QTimer(self)
         self.thumbnail_timer.setSingleShot(True)
         self.thumbnail_timer.timeout.connect(self._refresh_thumbnail_strip)
         self._thumbnail_pending_center_ms = 0
+        self._thumbnail_refresh_running = False
+        self._thumbnail_refresh_queued = False
+        self._thumbnail_request_id = 0
+        self._thumbnail_thread: Optional[QThread] = None
+        self._thumbnail_worker: Optional[ThumbnailWorker] = None
 
         self.drop_filter = VideoDropFilter(self)
         self.drop_filter.dropped.connect(self.open_video)
@@ -713,6 +793,7 @@ class VideoTimeClipper(QMainWindow):
             QMessageBox.warning(self, "無法開啟", "找不到影片檔案。")
             return
 
+        self._cancel_thumbnail_worker()
         self._stop_fallback_playback()
         self.video_path = os.path.abspath(path)
         self.pending_start_ms = None
@@ -768,43 +849,76 @@ class VideoTimeClipper(QMainWindow):
         self.thumbnail_strip.set_range(None, None)
 
     def _schedule_thumbnail_refresh(self, center_ms: Optional[int] = None) -> None:
-        if not self.video_path:
+        if not self.video_path or self.pending_start_ms is None or self.pending_end_ms is None:
             return
         self._thumbnail_pending_center_ms = self.current_position_ms() if center_ms is None else max(0, int(center_ms))
-        self.thumbnail_timer.start(120)
+        self.thumbnail_timer.start(350)
 
     def _refresh_thumbnail_strip(self) -> None:
-        if not self.video_path or cv2 is None:
+        if (
+            not self.video_path
+            or cv2 is None
+            or self.pending_start_ms is None
+            or self.pending_end_ms is None
+        ):
             return
 
-        capture = cv2.VideoCapture(self.video_path)
-        if not capture.isOpened():
+        if self._thumbnail_refresh_running:
+            self._thumbnail_request_id += 1
+            self._thumbnail_refresh_queued = True
+            if self._thumbnail_thread is not None:
+                self._thumbnail_thread.requestInterruption()
             return
 
         view_start_ms, view_end_ms = self._thumbnail_view_window()
         self.thumbnail_strip.set_view(view_start_ms, view_end_ms)
-        thumbnail_count = 15
-        thumbnails: list[tuple[int, QPixmap]] = []
-        for index in range(thumbnail_count):
-            if thumbnail_count == 1 or view_end_ms <= view_start_ms:
-                position_ms = view_start_ms
-            else:
-                position_ms = int(view_start_ms + ((view_end_ms - view_start_ms) * index) / (thumbnail_count - 1))
+        self._thumbnail_request_id += 1
+        request_id = self._thumbnail_request_id
+        self._thumbnail_refresh_running = True
 
-            capture.set(cv2.CAP_PROP_POS_MSEC, position_ms)
-            ok, frame = capture.read()
-            if not ok:
-                continue
+        thread = QThread(self)
+        worker = ThumbnailWorker(request_id, self.video_path, view_start_ms, view_end_ms)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_thumbnail_worker_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_thumbnail_thread_finished)
+        self._thumbnail_thread = thread
+        self._thumbnail_worker = worker
+        thread.start()
 
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            height, width, channels = rgb_frame.shape
-            bytes_per_line = channels * width
-            image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
-            thumbnails.append((position_ms, QPixmap.fromImage(image)))
-
-        capture.release()
-        self.thumbnail_strip.set_thumbnails(thumbnails)
+    def _on_thumbnail_worker_finished(
+        self, request_id: int, view_start_ms: int, view_end_ms: int, thumbnails: list[tuple[int, QImage]]
+    ) -> None:
+        if request_id != self._thumbnail_request_id:
+            return
+        self.thumbnail_strip.set_view(view_start_ms, view_end_ms)
+        self.thumbnail_strip.set_thumbnails([(position_ms, QPixmap.fromImage(image)) for position_ms, image in thumbnails])
         self.thumbnail_strip.set_range(self.pending_start_ms, self.pending_end_ms)
+
+    def _on_thumbnail_thread_finished(self) -> None:
+        self._thumbnail_refresh_running = False
+        self._thumbnail_thread = None
+        self._thumbnail_worker = None
+        if self._thumbnail_refresh_queued:
+            self._thumbnail_refresh_queued = False
+            QTimer.singleShot(0, self._refresh_thumbnail_strip)
+
+    def _cancel_thumbnail_worker(self, wait: bool = False) -> None:
+        self.thumbnail_timer.stop()
+        self._thumbnail_request_id += 1
+        self._thumbnail_refresh_queued = False
+        if self._thumbnail_thread is not None and self._thumbnail_thread.isRunning():
+            self._thumbnail_thread.requestInterruption()
+            self._thumbnail_thread.quit()
+            if wait:
+                self._thumbnail_thread.wait(1500)
+                if not self._thumbnail_thread.isRunning():
+                    self._thumbnail_refresh_running = False
+                    self._thumbnail_thread = None
+                    self._thumbnail_worker = None
 
     def _thumbnail_view_window(self) -> tuple[int, int]:
         if self.duration_ms <= 0:
@@ -843,7 +957,22 @@ class VideoTimeClipper(QMainWindow):
         if self._fallback_active:
             self._resume_fallback_playback()
 
-    def set_player_position(self, position_ms: int, refresh_thumbnails: bool = True) -> None:
+    def _schedule_player_position(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
+        upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
+        self._pending_seek_ms = max(0, min(int(position_ms), upper_bound))
+        self._pending_seek_refresh_thumbnails = refresh_thumbnails
+        self.seek_timer.start(SEEK_DEBOUNCE_MS)
+
+    def _apply_pending_seek(self) -> None:
+        if self._pending_seek_ms is None:
+            return
+        position_ms = self._pending_seek_ms
+        refresh_thumbnails = self._pending_seek_refresh_thumbnails
+        self._pending_seek_ms = None
+        self._pending_seek_refresh_thumbnails = False
+        self.set_player_position(position_ms, refresh_thumbnails=refresh_thumbnails)
+
+    def set_player_position(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
         upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
         position_ms = max(0, min(int(position_ms), upper_bound))
         if self._fallback_active:
@@ -880,9 +1009,7 @@ class VideoTimeClipper(QMainWindow):
         self.status_label.setText(reason)
         self._set_play_button_state(is_playing=True)
         self._render_fallback_frame()
-        self._schedule_thumbnail_refresh(0)
-        interval_ms = max(15, min(80, int(1000 / self._fallback_fps)))
-        self.fallback_timer.start(interval_ms)
+        self.fallback_timer.start(self._playback_interval_ms())
 
     def _stop_fallback_playback(self) -> None:
         self.fallback_timer.stop()
@@ -904,8 +1031,7 @@ class VideoTimeClipper(QMainWindow):
             return
         self._fallback_playing = True
         self._set_play_button_state(is_playing=True)
-        interval_ms = max(15, min(80, int(1000 / self._fallback_fps)))
-        self.fallback_timer.start(interval_ms)
+        self.fallback_timer.start(self._playback_interval_ms())
 
     def _seek_fallback(self, position_ms: int, refresh_thumbnails: bool = True) -> None:
         if not self._fallback_capture:
@@ -918,8 +1044,11 @@ class VideoTimeClipper(QMainWindow):
         if refresh_thumbnails:
             self._schedule_thumbnail_refresh(position_ms)
         if was_playing:
-            interval_ms = max(15, min(80, int(1000 / self._fallback_fps)))
-            self.fallback_timer.start(interval_ms)
+            self.fallback_timer.start(self._playback_interval_ms())
+
+    def _playback_interval_ms(self) -> int:
+        fps = min(max(self._fallback_fps, 1.0), PLAYBACK_MAX_FPS)
+        return max(45, int(1000 / fps))
 
     def _render_fallback_frame(self) -> None:
         if not self._fallback_capture:
@@ -939,14 +1068,14 @@ class VideoTimeClipper(QMainWindow):
         self._update_position_labels(self._fallback_position_ms)
 
     def _show_fallback_frame(self, frame) -> None:
+        label_size = self.frame_label.size()
+        if not label_size.isEmpty():
+            frame = resize_frame_to_fit(frame, label_size.width(), label_size.height())
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         height, width, channels = rgb_frame.shape
         bytes_per_line = channels * width
         image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
-        pixmap = QPixmap.fromImage(image)
-        if not self.frame_label.size().isEmpty():
-            pixmap = pixmap.scaled(self.frame_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.frame_label.setPixmap(pixmap)
+        self.frame_label.setPixmap(QPixmap.fromImage(image))
 
     def _update_position_labels(self, position_ms: int) -> None:
         if not self._slider_is_pressed:
@@ -1072,7 +1201,7 @@ class VideoTimeClipper(QMainWindow):
     def _on_slider_moved(self, slider_value: int) -> None:
         self._set_slider_value_without_feedback(slider_value)
         target_ms = self._slider_value_to_ms(slider_value)
-        self.set_player_position(target_ms)
+        self._schedule_player_position(target_ms)
         self.current_time_label.setText(format_time(target_ms))
 
     def _on_thumbnail_range_changed(self, start_ms: int, end_ms: int) -> None:
@@ -1082,16 +1211,20 @@ class VideoTimeClipper(QMainWindow):
         self.update_actions()
 
     def _on_thumbnail_handle_moved(self, position_ms: int) -> None:
-        self.set_player_position(position_ms, refresh_thumbnails=False)
+        self._schedule_player_position(position_ms, refresh_thumbnails=False)
+        self._update_position_labels(position_ms)
 
     def _on_slider_released(self, slider_value: Optional[int] = None) -> None:
         self._slider_is_pressed = False
         if slider_value is not None:
             self._set_slider_value_without_feedback(slider_value)
+        self.seek_timer.stop()
+        self._pending_seek_ms = None
         self.set_player_position(self._slider_value_to_ms(self.seek_slider.value()))
         self._resume_after_slider_scan()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        self._cancel_thumbnail_worker(wait=True)
         self._stop_fallback_playback()
         super().closeEvent(event)
 
