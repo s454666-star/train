@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -41,6 +42,8 @@ if cv2 is not None:
 
 
 VIDEO_FILTER = "影片檔案 (*.mp4 *.mkv *.mov *.avi *.wmv *.m4v);;所有檔案 (*.*)"
+TEXT_FILTER = "文字檔案 (*.txt);;所有檔案 (*.*)"
+DEFAULT_OUTPUT_LIST_PATH = r"C:\Users\User\Documents\清單.txt"
 SLIDER_STEP_MS = 1000
 PLAYBACK_MAX_FPS = 12.0
 SEEK_DEBOUNCE_MS = 45
@@ -544,6 +547,9 @@ class VideoTimeClipper(QMainWindow):
         self.copy_button = QPushButton("複製")
         self.copy_button.setObjectName("primaryButton")
         self.copy_button.setEnabled(False)
+        self.write_button = QPushButton("寫入")
+        self.write_button.setObjectName("primaryButton")
+        self.write_button.setEnabled(False)
 
         self.start_value_label = QLabel("--:--")
         self.start_value_label.setObjectName("captureValue")
@@ -566,6 +572,20 @@ class VideoTimeClipper(QMainWindow):
         self.status_label.setObjectName("statusLabel")
         self.status_label.setWordWrap(True)
 
+        output_path_row = QHBoxLayout()
+        output_path_row.setSpacing(7)
+        self.output_path_label = QLabel("寫入檔案")
+        self.output_path_label.setObjectName("caption")
+        self.output_path_edit = QLineEdit(DEFAULT_OUTPUT_LIST_PATH)
+        self.output_path_edit.setObjectName("outputPathEdit")
+        self.output_path_edit.setMinimumWidth(360)
+        self.output_path_edit.setToolTip("按「寫入」會把目前複製內容追加到這個檔案最下面")
+        self.pick_output_path_button = QPushButton("選擇")
+        self.pick_output_path_button.setToolTip("選擇要追加寫入的清單檔案")
+        output_path_row.addWidget(self.output_path_label)
+        output_path_row.addWidget(self.output_path_edit, stretch=1)
+        output_path_row.addWidget(self.pick_output_path_button)
+
         main_button_row.addWidget(self.open_button)
         main_button_row.addWidget(self.play_button)
         main_button_row.addWidget(self.rewind_button)
@@ -579,6 +599,7 @@ class VideoTimeClipper(QMainWindow):
         main_button_row.addWidget(self.delete_segment_button)
         main_button_row.addWidget(self.clear_segments_button)
         main_button_row.addWidget(self.copy_button)
+        main_button_row.addWidget(self.write_button)
         main_button_row.addStretch(1)
         main_button_row.addWidget(self.status_label, stretch=1)
 
@@ -594,6 +615,7 @@ class VideoTimeClipper(QMainWindow):
         bottom_layout.addLayout(timeline)
         bottom_layout.addWidget(self.thumbnail_strip)
         bottom_layout.addLayout(main_button_row)
+        bottom_layout.addLayout(output_path_row)
         bottom_layout.addLayout(bottom_grid)
 
         root.addWidget(player_panel, stretch=1)
@@ -605,6 +627,7 @@ class VideoTimeClipper(QMainWindow):
         self.rewind_button.setIcon(self.style().standardIcon(QStyle.SP_MediaSeekBackward))
         self.forward_button.setIcon(self.style().standardIcon(QStyle.SP_MediaSeekForward))
         self.copy_button.setIcon(self.style().standardIcon(QStyle.SP_DialogSaveButton))
+        self.write_button.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
 
     def _enable_drop_everywhere(self) -> None:
         for widget in [self, self.centralWidget(), *self.findChildren(QWidget)]:
@@ -642,6 +665,8 @@ class VideoTimeClipper(QMainWindow):
         self.set_end_button.clicked.connect(self.capture_end)
         self.add_segment_button.clicked.connect(self.add_segment)
         self.copy_button.clicked.connect(self.copy_output)
+        self.write_button.clicked.connect(self.write_output_to_file)
+        self.pick_output_path_button.clicked.connect(self.pick_output_file)
         self.delete_segment_button.clicked.connect(self.delete_selected_segments)
         self.clear_segments_button.clicked.connect(self.clear_segments)
 
@@ -658,6 +683,7 @@ class VideoTimeClipper(QMainWindow):
         QShortcut(QKeySequence("]"), self, activated=self.capture_end)
         QShortcut(QKeySequence("A"), self, activated=self.add_segment)
         QShortcut(QKeySequence("Ctrl+C"), self, activated=self.copy_output)
+        QShortcut(QKeySequence("Ctrl+S"), self, activated=self.write_output_to_file)
 
     def _apply_style(self) -> None:
         QApplication.instance().setFont(QFont("Microsoft JhengHei UI", 10))
@@ -786,6 +812,14 @@ class VideoTimeClipper(QMainWindow):
             QPushButton#primaryButton:hover:!disabled {
                 background: #15803d;
             }
+            QLineEdit#outputPathEdit {
+                color: #dbeafe;
+                background: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                padding: 6px 8px;
+                selection-background-color: #2563eb;
+            }
             QSlider::groove:horizontal {
                 height: 10px;
                 background: #334155;
@@ -810,6 +844,12 @@ class VideoTimeClipper(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "選擇影片", start_dir, VIDEO_FILTER)
         if path:
             self.open_video(path)
+
+    def pick_output_file(self) -> None:
+        current_path = self.output_path_edit.text().strip() or DEFAULT_OUTPUT_LIST_PATH
+        path, _ = QFileDialog.getSaveFileName(self, "選擇寫入檔案", current_path, TEXT_FILTER)
+        if path:
+            self.output_path_edit.setText(path)
 
     def open_video(self, path: str) -> None:
         if not os.path.isfile(path):
@@ -1183,16 +1223,64 @@ class VideoTimeClipper(QMainWindow):
             self.set_player_position(segment.normalized().start_ms)
 
     def copy_output(self) -> None:
-        if not self.video_path:
-            return
-        if self.segment_list.count() == 0 and self.pending_start_ms is not None and self.pending_end_ms is not None:
-            self.add_segment()
-        output = self.build_output_text()
+        output = self._prepare_output_text()
         if not output:
             return
         QApplication.clipboard().setText(output)
         self.status_label.setText("已複製到剪貼簿")
         self.output_preview.setText(output)
+
+    def write_output_to_file(self) -> None:
+        output = self._prepare_output_text()
+        if not output:
+            return
+
+        target_text = self.output_path_edit.text().strip().strip('"')
+        if not target_text:
+            QMessageBox.warning(self, "缺少檔案", "請先設定要寫入的清單檔案。")
+            return
+
+        target_path = Path(os.path.expandvars(os.path.expanduser(target_text)))
+        try:
+            self._append_text_block(target_path, output)
+        except OSError as exc:
+            QMessageBox.warning(self, "寫入失敗", f"無法寫入檔案：\n{target_path}\n\n{exc}")
+            return
+
+        self.status_label.setText(f"已寫入：{target_path}")
+        self.output_preview.setText(output)
+
+    def _prepare_output_text(self) -> str:
+        if not self.video_path:
+            return ""
+        if self.segment_list.count() == 0 and self.pending_start_ms is not None and self.pending_end_ms is not None:
+            self.add_segment()
+        return self.build_output_text()
+
+    def _append_text_block(self, target_path: Path, text: str) -> None:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        newline = self._detect_text_newline(target_path)
+        prefix = ""
+        if target_path.exists() and target_path.stat().st_size > 0:
+            tail = target_path.read_bytes()[-8:]
+            newline_bytes = newline.encode("utf-8")
+            double_newline = newline_bytes + newline_bytes
+            if tail.endswith(double_newline):
+                prefix = ""
+            elif tail.endswith(newline_bytes):
+                prefix = newline
+            else:
+                prefix = newline + newline
+
+        with target_path.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(prefix + text.rstrip() + newline + newline)
+
+    def _detect_text_newline(self, target_path: Path) -> str:
+        if not target_path.exists() or target_path.stat().st_size == 0:
+            return "\n"
+        with target_path.open("rb") as handle:
+            sample = handle.read(4096)
+        return "\r\n" if b"\r\n" in sample else "\n"
 
     def build_output_text(self) -> str:
         if not self.video_path or self.segment_list.count() == 0:
@@ -1257,6 +1345,7 @@ class VideoTimeClipper(QMainWindow):
         has_segments = self.segment_list.count() > 0
         self.add_segment_button.setEnabled(has_video and has_pending_segment)
         self.copy_button.setEnabled(has_video and (has_segments or has_pending_segment))
+        self.write_button.setEnabled(has_video and (has_segments or has_pending_segment))
         self.delete_segment_button.setEnabled(bool(self.segment_list.selectedItems()))
         self.clear_segments_button.setEnabled(has_segments)
         self.output_preview.setText(self.build_output_text())
