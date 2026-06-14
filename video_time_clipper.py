@@ -555,6 +555,11 @@ class VideoTimeClipper(QMainWindow):
         self.start_value_label.setObjectName("captureValue")
         self.end_value_label = QLabel("--:--")
         self.end_value_label.setObjectName("captureValue")
+        self.capture_total_title = QLabel("總長")
+        self.capture_total_title.setObjectName("caption")
+        self.capture_total_label = QLabel("0.0 分")
+        self.capture_total_label.setObjectName("captureValue")
+        self.capture_total_label.setToolTip("已加入片段加上目前 [ ] 擷取範圍的總長")
 
         self.segment_list = SegmentList(self)
         self.segment_list.setObjectName("segmentList")
@@ -595,6 +600,8 @@ class VideoTimeClipper(QMainWindow):
         main_button_row.addWidget(self.start_value_label)
         main_button_row.addWidget(self.set_end_button)
         main_button_row.addWidget(self.end_value_label)
+        main_button_row.addWidget(self.capture_total_title)
+        main_button_row.addWidget(self.capture_total_label)
         main_button_row.addWidget(self.add_segment_button)
         main_button_row.addWidget(self.delete_segment_button)
         main_button_row.addWidget(self.clear_segments_button)
@@ -1293,9 +1300,28 @@ class VideoTimeClipper(QMainWindow):
                 lines.append(segment.label())
         return "\n".join(lines)
 
+    def _captured_duration_ms(self) -> int:
+        total_ms = 0
+        for index in range(self.segment_list.count()):
+            item = self.segment_list.item(index)
+            segment = item.data(Qt.UserRole)
+            if isinstance(segment, ClipSegment):
+                normalized = segment.normalized()
+                total_ms += max(0, normalized.end_ms - normalized.start_ms)
+        if self.pending_start_ms is not None and self.pending_end_ms is not None:
+            total_ms += abs(self.pending_end_ms - self.pending_start_ms)
+        return total_ms
+
+    def _refresh_capture_total_label(self) -> None:
+        total_ms = self._captured_duration_ms()
+        minutes = total_ms / 60_000
+        self.capture_total_label.setText(f"{minutes:.1f} 分")
+        self.capture_total_label.setToolTip(f"目前擷取總長：{format_time(total_ms)}")
+
     def _refresh_capture_labels(self) -> None:
         self.start_value_label.setText(format_time(self.pending_start_ms) if self.pending_start_ms is not None else "--:--")
         self.end_value_label.setText(format_time(self.pending_end_ms) if self.pending_end_ms is not None else "--:--")
+        self._refresh_capture_total_label()
 
     def _on_slider_pressed(self) -> None:
         self._slider_is_pressed = True
@@ -1348,6 +1374,7 @@ class VideoTimeClipper(QMainWindow):
         self.write_button.setEnabled(has_video and (has_segments or has_pending_segment))
         self.delete_segment_button.setEnabled(bool(self.segment_list.selectedItems()))
         self.clear_segments_button.setEnabled(has_segments)
+        self._refresh_capture_total_label()
         self.output_preview.setText(self.build_output_text())
 
 
