@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import os
+import queue
 import shutil
 import subprocess
 import sys
 import ctypes
 import faulthandler
+import json
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -86,6 +89,59 @@ _CRASH_LOG_HANDLE = None
 
 def ffmpeg_executable() -> Optional[str]:
     return shutil.which("ffmpeg") or (r"C:\ffmpeg\bin\ffmpeg.exe" if os.path.isfile(r"C:\ffmpeg\bin\ffmpeg.exe") else None)
+
+
+def ffprobe_executable() -> Optional[str]:
+    return shutil.which("ffprobe") or (r"C:\ffmpeg\bin\ffprobe.exe" if os.path.isfile(r"C:\ffmpeg\bin\ffprobe.exe") else None)
+
+
+def mpv_executable() -> Optional[str]:
+    candidates = [shutil.which("mpv")]
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        package_root = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+        candidates.extend(str(path) for path in package_root.glob("mpv-player.mpv-CI.MSVC*\\mpv.exe"))
+    candidates.extend(
+        [
+            r"C:\Program Files\Topaz Labs LLC\Topaz Video\mpv.exe",
+            r"C:\Program Files\Topaz Labs LLC\Topaz Video AI BETA\mpv.exe",
+        ]
+    )
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def probe_video_duration_ms(video_path: str) -> int:
+    ffprobe_path = ffprobe_executable()
+    if not ffprobe_path:
+        return 0
+    cmd = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nw=1:nk=1",
+        video_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    try:
+        return max(0, int(float(result.stdout.strip()) * 1000))
+    except ValueError:
+        return 0
 
 
 def read_video_image_with_ffmpeg(video_path: str, position_ms: int, max_width: int, timeout: int = 8) -> QImage:
@@ -779,6 +835,14 @@ class VideoTimeClipper(QMainWindow):
         self._vlc_player = None
         self._vlc_active = False
         self._vlc_playing = False
+        self._mpv_process: Optional[subprocess.Popen] = None
+        self._mpv_ipc_file = None
+        self._mpv_pipe_name = ""
+        self._mpv_ipc_lock = threading.RLock()
+        self._mpv_command_queue: queue.Queue = queue.Queue()
+        self._mpv_ipc_stop = threading.Event()
+        self._mpv_active = False
+        self._mpv_playing = False
 
         self.fallback_timer = QTimer(self)
         self.fallback_timer.timeout.connect(self._render_fallback_frame)
@@ -795,6 +859,14 @@ class VideoTimeClipper(QMainWindow):
         self._vlc_terminal_seek_retry_active = False
         self._vlc_terminal_seek_retry_ms: Optional[int] = None
         self._last_vlc_scrub_at = 0.0
+        self.mpv_timer = QTimer(self)
+        self.mpv_timer.timeout.connect(self._sync_mpv_position)
+        self.mpv_scrub_timer = QTimer(self)
+        self.mpv_scrub_timer.setSingleShot(True)
+        self.mpv_scrub_timer.timeout.connect(self._apply_pending_mpv_scrub)
+        self._pending_mpv_scrub_ms: Optional[int] = None
+        self._pending_mpv_scrub_refresh_thumbnails = False
+        self._last_mpv_scrub_at = 0.0
         self._pending_seek_ms: Optional[int] = None
         self._pending_seek_refresh_thumbnails = False
         self.thumbnail_timer = QTimer(self)
@@ -1215,6 +1287,7 @@ class VideoTimeClipper(QMainWindow):
             return
 
         self._cancel_thumbnail_worker()
+        self._stop_mpv_playback()
         self._stop_vlc_playback()
         self._stop_fallback_playback()
         self.video_path = os.path.abspath(path)
@@ -1244,6 +1317,8 @@ class VideoTimeClipper(QMainWindow):
         QTimer.singleShot(0, lambda: self._start_fallback_playback("逐秒掃描播放模式已啟動"))
 
     def current_position_ms(self) -> int:
+        if self._mpv_active:
+            return int(self._fallback_position_ms)
         if self._vlc_active and self._vlc_player is not None:
             position_ms = int(self._vlc_player.get_time() or 0)
             return max(0, position_ms)
@@ -1380,6 +1455,8 @@ class VideoTimeClipper(QMainWindow):
         return int(view_start), int(view_end)
 
     def _is_currently_playing(self) -> bool:
+        if self._mpv_active:
+            return self._mpv_playing
         if self._vlc_active:
             return self._vlc_playing
         if self._fallback_active:
@@ -1387,6 +1464,8 @@ class VideoTimeClipper(QMainWindow):
         return False
 
     def _pause_for_slider_scan(self) -> None:
+        if self._mpv_active:
+            return
         if self._vlc_active:
             return
         elif self._fallback_active:
@@ -1396,13 +1475,21 @@ class VideoTimeClipper(QMainWindow):
         if not self._resume_after_slider:
             return
         self._resume_after_slider = False
-        if self._vlc_active:
+        if self._mpv_active:
+            self._resume_mpv_playback()
+        elif self._vlc_active:
             self._resume_vlc_playback()
         elif self._fallback_active:
             self._resume_fallback_playback()
 
     def _schedule_player_position(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
         upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
+        if self._mpv_active:
+            self._schedule_mpv_scrub(
+                max(0, min(int(position_ms), upper_bound)),
+                refresh_thumbnails=refresh_thumbnails,
+            )
+            return
         if self._vlc_active:
             self._schedule_vlc_scrub(
                 max(0, min(int(position_ms), upper_bound)),
@@ -1433,6 +1520,26 @@ class VideoTimeClipper(QMainWindow):
         self._last_vlc_scrub_at = time.perf_counter()
         self._seek_vlc(position_ms, refresh_thumbnails=refresh_thumbnails)
 
+    def _schedule_mpv_scrub(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
+        self._pending_mpv_scrub_ms = int(position_ms)
+        self._pending_mpv_scrub_refresh_thumbnails = self._pending_mpv_scrub_refresh_thumbnails or refresh_thumbnails
+        elapsed_ms = (time.perf_counter() - self._last_mpv_scrub_at) * 1000
+        if elapsed_ms >= VLC_SCRUB_THROTTLE_MS:
+            self._apply_pending_mpv_scrub()
+            return
+        if not self.mpv_scrub_timer.isActive():
+            self.mpv_scrub_timer.start(max(1, int(VLC_SCRUB_THROTTLE_MS - elapsed_ms)))
+
+    def _apply_pending_mpv_scrub(self) -> None:
+        if self._pending_mpv_scrub_ms is None:
+            return
+        position_ms = self._pending_mpv_scrub_ms
+        refresh_thumbnails = self._pending_mpv_scrub_refresh_thumbnails
+        self._pending_mpv_scrub_ms = None
+        self._pending_mpv_scrub_refresh_thumbnails = False
+        self._last_mpv_scrub_at = time.perf_counter()
+        self._seek_mpv(position_ms, refresh_thumbnails=refresh_thumbnails)
+
     def _apply_pending_seek(self) -> None:
         if self._pending_seek_ms is None:
             return
@@ -1445,15 +1552,21 @@ class VideoTimeClipper(QMainWindow):
     def _seek_player_position_now(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
         self.seek_timer.stop()
         self.vlc_scrub_timer.stop()
+        self.mpv_scrub_timer.stop()
         self._pending_seek_ms = None
         self._pending_seek_refresh_thumbnails = False
         self._pending_vlc_scrub_ms = None
         self._pending_vlc_scrub_refresh_thumbnails = False
+        self._pending_mpv_scrub_ms = None
+        self._pending_mpv_scrub_refresh_thumbnails = False
         self.set_player_position(position_ms, refresh_thumbnails=refresh_thumbnails)
 
     def set_player_position(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
         upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
         position_ms = max(0, min(int(position_ms), upper_bound))
+        if self._mpv_active:
+            self._seek_mpv(position_ms, refresh_thumbnails=refresh_thumbnails)
+            return
         if self._vlc_active:
             self._seek_vlc(position_ms, refresh_thumbnails=refresh_thumbnails)
             return
@@ -1461,6 +1574,265 @@ class VideoTimeClipper(QMainWindow):
             self._seek_fallback(position_ms, refresh_thumbnails=refresh_thumbnails)
             return
         self._update_position_labels(position_ms)
+
+    def _start_mpv_playback(self, reason: str) -> bool:
+        if not self.video_path:
+            return False
+        mpv_path = mpv_executable()
+        if not mpv_path:
+            self.status_label.setText("找不到 mpv 播放器")
+            return False
+
+        duration_ms = probe_video_duration_ms(self.video_path)
+        if duration_ms > 0:
+            self._set_slider_duration(duration_ms)
+        self._show_safe_preview_frame(0)
+
+        hwnd = int(self.frame_label.winId())
+        pipe_name = rf"\\.\pipe\video-time-clipper-{uuid.uuid4().hex}"
+        self._mpv_command_queue = queue.Queue()
+        self._mpv_ipc_stop = threading.Event()
+        args = [
+            mpv_path,
+            "--no-config",
+            "--force-window=immediate",
+            f"--wid={hwnd}",
+            "--keep-open=yes",
+            "--idle=no",
+            "--input-terminal=no",
+            f"--input-ipc-server={pipe_name}",
+            "--osc=no",
+            "--osd-level=0",
+            "--hwdec=no",
+            "--vo=gpu",
+            "--gpu-api=d3d11",
+            "--framedrop=vo",
+            "--msg-level=all=error",
+            self.video_path,
+        ]
+        try:
+            process = subprocess.Popen(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except OSError as exc:
+            self.status_label.setText(f"mpv 啟動失敗：{exc}")
+            return False
+
+        self._mpv_process = process
+        self._mpv_pipe_name = pipe_name
+        self._start_mpv_ipc_connector(process, pipe_name)
+        self._mpv_active = True
+        self._mpv_playing = True
+        self._vlc_active = False
+        self._vlc_playing = False
+        self._fallback_active = False
+        self._fallback_playing = False
+        self._fallback_backend = "MPV"
+        self._fallback_position_ms = 0
+        self._set_play_button_state(is_playing=True)
+        self.status_label.setText(f"{reason}（mpv 外部播放器）")
+        self._sync_playback_clock()
+        self.mpv_timer.start(100)
+        QTimer.singleShot(700, self._sync_mpv_position)
+        return True
+
+    def _stop_mpv_playback(self) -> None:
+        self.mpv_timer.stop()
+        self.mpv_scrub_timer.stop()
+        self._pending_mpv_scrub_ms = None
+        self._pending_mpv_scrub_refresh_thumbnails = False
+        process = self._mpv_process
+        with self._mpv_ipc_lock:
+            ipc_file = self._mpv_ipc_file
+        self._mpv_process = None
+        with self._mpv_ipc_lock:
+            self._mpv_ipc_file = None
+        self._mpv_pipe_name = ""
+        self._mpv_active = False
+        self._mpv_playing = False
+        self._mpv_ipc_stop.set()
+        try:
+            self._mpv_command_queue.put_nowait(None)
+        except Exception:
+            pass
+        if process is None:
+            if ipc_file is not None:
+                threading.Thread(
+                    target=self._close_mpv_ipc_file,
+                    args=(ipc_file,),
+                    name="VideoTimeClipperMpvIpcClose",
+                    daemon=True,
+                ).start()
+            return
+        threading.Thread(
+            target=self._terminate_mpv_process,
+            args=(process, ipc_file),
+            name="VideoTimeClipperMpvStop",
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _close_mpv_ipc_file(ipc_file) -> None:
+        try:
+            ipc_file.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _terminate_mpv_process(process: subprocess.Popen, ipc_file=None) -> None:
+        if ipc_file is not None:
+            try:
+                if process.poll() is None:
+                    ipc_file.write((json.dumps({"command": ["quit"]}) + "\n").encode("utf-8"))
+            except Exception:
+                pass
+        try:
+            process.wait(timeout=1)
+        except Exception:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        if ipc_file is not None:
+            try:
+                ipc_file.close()
+            except Exception:
+                pass
+
+    def _start_mpv_ipc_connector(self, process: subprocess.Popen, pipe_name: str) -> None:
+        threading.Thread(
+            target=self._connect_mpv_ipc_background,
+            args=(process, pipe_name),
+            name="VideoTimeClipperMpvIpcConnect",
+            daemon=True,
+        ).start()
+
+    def _connect_mpv_ipc_background(self, process: subprocess.Popen, pipe_name: str) -> None:
+        deadline = time.perf_counter() + 5.0
+        while time.perf_counter() < deadline:
+            if process.poll() is not None:
+                return
+            try:
+                ipc_file = open(pipe_name, "r+b", buffering=0)
+            except OSError:
+                time.sleep(0.05)
+                continue
+
+            with self._mpv_ipc_lock:
+                if self._mpv_process is not process or self._mpv_pipe_name != pipe_name:
+                    try:
+                        ipc_file.close()
+                    except Exception:
+                        pass
+                    return
+                self._mpv_ipc_file = ipc_file
+            threading.Thread(
+                target=self._write_mpv_ipc_commands,
+                args=(ipc_file, self._mpv_command_queue, self._mpv_ipc_stop),
+                name="VideoTimeClipperMpvIpcWrite",
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=self._drain_mpv_ipc,
+                args=(ipc_file,),
+                name="VideoTimeClipperMpvIpcDrain",
+                daemon=True,
+            ).start()
+            return
+
+    @staticmethod
+    def _write_mpv_ipc_commands(ipc_file, command_queue: queue.Queue, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                command = command_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if command is None:
+                return
+            try:
+                ipc_file.write((json.dumps({"command": command}) + "\n").encode("utf-8"))
+            except Exception:
+                return
+
+    @staticmethod
+    def _drain_mpv_ipc(ipc_file) -> None:
+        try:
+            while True:
+                line = ipc_file.readline()
+                if not line:
+                    return
+        except Exception:
+            return
+
+    def _send_mpv_command(self, command: str) -> bool:
+        if not self._mpv_active:
+            return False
+        try:
+            self._mpv_command_queue.put_nowait(command)
+            return True
+        except Exception:
+            return False
+
+    def _pause_mpv_playback(self) -> None:
+        if not self._mpv_active:
+            return
+        self._fallback_position_ms = self._playback_target_position_ms()
+        self._send_mpv_command(["cycle", "pause"])
+        self._mpv_playing = False
+        self._sync_playback_clock()
+        self._set_play_button_state(is_playing=False)
+
+    def _resume_mpv_playback(self) -> None:
+        if not self._mpv_active:
+            return
+        if self.duration_ms > 0 and self._fallback_position_ms >= self.duration_ms - 500:
+            self._seek_mpv(0, refresh_thumbnails=False)
+        self._send_mpv_command(["cycle", "pause"])
+        self._mpv_playing = True
+        self._sync_playback_clock()
+        self._set_play_button_state(is_playing=True)
+
+    def _seek_mpv(self, position_ms: int, refresh_thumbnails: bool = True) -> None:
+        if not self._mpv_active:
+            return
+        upper_bound = self.duration_ms if self.duration_ms > 0 else max(0, int(position_ms))
+        position_ms = max(0, min(int(position_ms), upper_bound))
+        self._send_mpv_command(["seek", position_ms / 1000, "absolute+exact"])
+        self._fallback_position_ms = position_ms
+        self._sync_playback_clock()
+        self._update_position_labels(position_ms)
+        if refresh_thumbnails:
+            self._schedule_thumbnail_refresh(position_ms)
+
+    def _sync_mpv_position(self) -> None:
+        if not self._mpv_active or self._mpv_process is None:
+            return
+        if self._mpv_process.poll() is not None:
+            ended_near_duration = self.duration_ms > 0 and self._fallback_position_ms >= self.duration_ms - 1000
+            self.mpv_timer.stop()
+            self._mpv_active = False
+            self._mpv_playing = False
+            self._set_play_button_state(is_playing=False)
+            if not ended_near_duration:
+                self.status_label.setText("mpv 播放程序已結束，GUI 仍可繼續使用")
+            return
+        if self._mpv_playing:
+            position_ms = self._playback_target_position_ms()
+            if self.duration_ms > 0:
+                position_ms = min(position_ms, self.duration_ms)
+            self._fallback_position_ms = position_ms
+            self._update_position_labels(position_ms)
+            if self.duration_ms > 0 and position_ms >= self.duration_ms - 250:
+                self._mpv_playing = False
+                self._set_play_button_state(is_playing=False)
 
     def _start_vlc_playback(self, reason: str) -> bool:
         if vlc is None or not self.video_path:
@@ -1674,13 +2046,11 @@ class VideoTimeClipper(QMainWindow):
     def _start_fallback_playback(self, reason: str) -> None:
         if self._fallback_active or not self.video_path:
             return
-        tried_vlc = vlc is not None
-        if self._start_vlc_playback(reason):
+        if self._start_mpv_playback(reason):
             return
-        if tried_vlc:
-            self.frame_label.setText("VLC 無法播放這支影片")
-            self.status_label.setText("VLC 播放器無法開啟這支影片，已停止以避免 PyAV/OpenCV 解碼崩潰。")
-            self._set_play_button_state(is_playing=False)
+        if mpv_executable():
+            self.frame_label.setText("mpv 無法播放這支影片")
+            self.status_label.setText("mpv 外部播放器無法開啟這支影片；已避免使用容易崩潰的 VLC/PyAV/OpenCV。")
             return
         if cv2 is None:
             self.status_label.setText(f"{reason}，但目前 Python 沒有 OpenCV 可用。")
@@ -1784,7 +2154,7 @@ class VideoTimeClipper(QMainWindow):
         self._playback_clock_started_at = time.perf_counter()
 
     def _playback_target_position_ms(self) -> int:
-        if not self._fallback_playing or self._playback_clock_started_at <= 0:
+        if not (self._fallback_playing or self._mpv_playing) or self._playback_clock_started_at <= 0:
             return int(self._fallback_position_ms)
         elapsed_ms = int((time.perf_counter() - self._playback_clock_started_at) * 1000)
         target_ms = self._playback_clock_position_ms + max(0, elapsed_ms)
@@ -1875,6 +2245,12 @@ class VideoTimeClipper(QMainWindow):
 
     def toggle_playback(self) -> None:
         if not self.video_path:
+            return
+        if self._mpv_active:
+            if self._mpv_playing:
+                self._pause_mpv_playback()
+            else:
+                self._resume_mpv_playback()
             return
         if self._vlc_active:
             if self._vlc_playing:
@@ -2075,14 +2451,18 @@ class VideoTimeClipper(QMainWindow):
             self._set_slider_value_without_feedback(slider_value)
         self.seek_timer.stop()
         self.vlc_scrub_timer.stop()
+        self.mpv_scrub_timer.stop()
         self._pending_seek_ms = None
         self._pending_vlc_scrub_ms = None
         self._pending_vlc_scrub_refresh_thumbnails = False
+        self._pending_mpv_scrub_ms = None
+        self._pending_mpv_scrub_refresh_thumbnails = False
         self.set_player_position(self._slider_value_to_ms(self.seek_slider.value()))
         self._resume_after_slider_scan()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
         self._cancel_thumbnail_worker(wait=True)
+        self._stop_mpv_playback()
         self._stop_vlc_playback()
         self._stop_fallback_playback()
         super().closeEvent(event)
