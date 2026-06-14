@@ -47,6 +47,7 @@ SEEK_DEBOUNCE_MS = 45
 THUMBNAIL_COUNT = 9
 THUMBNAIL_MAX_WIDTH = 180
 THUMBNAIL_MAX_HEIGHT = 76
+SEEK_SLIDER_HIT_HEIGHT = 42
 
 
 def resize_frame_to_fit(frame, max_width: int, max_height: int):
@@ -98,6 +99,12 @@ class ClickableSlider(QSlider):
     scanStarted = pyqtSignal()
     scanMoved = pyqtSignal(int)
     scanFinished = pyqtSignal(int)
+
+    def __init__(self, orientation, parent=None) -> None:
+        super().__init__(orientation, parent)
+        if orientation == Qt.Horizontal:
+            self.setFixedHeight(SEEK_SLIDER_HIT_HEIGHT)
+        self.setCursor(Qt.PointingHandCursor)
 
     def _value_from_event(self, event) -> int:
         if self.orientation() == Qt.Horizontal:
@@ -780,20 +787,20 @@ class VideoTimeClipper(QMainWindow):
                 background: #15803d;
             }
             QSlider::groove:horizontal {
-                height: 8px;
+                height: 10px;
                 background: #334155;
-                border-radius: 4px;
+                border-radius: 5px;
             }
             QSlider::sub-page:horizontal {
                 background: #60a5fa;
-                border-radius: 4px;
+                border-radius: 5px;
             }
             QSlider::handle:horizontal {
                 background: #f9fafb;
                 border: 2px solid #60a5fa;
-                width: 18px;
-                margin: -6px 0;
-                border-radius: 9px;
+                width: 24px;
+                margin: -8px 0;
+                border-radius: 12px;
             }
             """
         )
