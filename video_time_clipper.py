@@ -792,6 +792,8 @@ class VideoTimeClipper(QMainWindow):
         self.seek_timer.timeout.connect(self._apply_pending_seek)
         self._pending_vlc_scrub_ms: Optional[int] = None
         self._pending_vlc_scrub_refresh_thumbnails = False
+        self._vlc_terminal_seek_retry_active = False
+        self._vlc_terminal_seek_retry_ms: Optional[int] = None
         self._last_vlc_scrub_at = 0.0
         self._pending_seek_ms: Optional[int] = None
         self._pending_seek_refresh_thumbnails = False
@@ -1440,6 +1442,15 @@ class VideoTimeClipper(QMainWindow):
         self._pending_seek_refresh_thumbnails = False
         self.set_player_position(position_ms, refresh_thumbnails=refresh_thumbnails)
 
+    def _seek_player_position_now(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
+        self.seek_timer.stop()
+        self.vlc_scrub_timer.stop()
+        self._pending_seek_ms = None
+        self._pending_seek_refresh_thumbnails = False
+        self._pending_vlc_scrub_ms = None
+        self._pending_vlc_scrub_refresh_thumbnails = False
+        self.set_player_position(position_ms, refresh_thumbnails=refresh_thumbnails)
+
     def set_player_position(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
         upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
         position_ms = max(0, min(int(position_ms), upper_bound))
@@ -1519,23 +1530,83 @@ class VideoTimeClipper(QMainWindow):
     def _resume_vlc_playback(self) -> None:
         if not self._vlc_player:
             return
-        self._vlc_player.set_pause(0)
+        try:
+            state = self._vlc_player.get_state()
+        except Exception:
+            state = None
+        if vlc is not None and state in (vlc.State.Ended, vlc.State.Stopped):
+            try:
+                target_ms = self._fallback_position_ms
+                if self.duration_ms > 0 and target_ms >= self.duration_ms - 500:
+                    target_ms = 0
+                self._vlc_player.play()
+                QApplication.processEvents()
+                self._vlc_player.set_time(max(0, min(target_ms, self.duration_ms)))
+            except Exception:
+                return
+        else:
+            self._vlc_player.set_pause(0)
         self._vlc_playing = True
         self._set_play_button_state(is_playing=True)
 
     def _seek_vlc(self, position_ms: int, refresh_thumbnails: bool = True) -> None:
         if not self._vlc_player:
             return
-        self._vlc_player.set_time(max(0, int(position_ms)))
-        self._fallback_position_ms = max(0, int(position_ms))
-        self._update_position_labels(self._fallback_position_ms)
-        if not self._vlc_playing:
+        position_ms = max(0, min(int(position_ms), self.duration_ms if self.duration_ms > 0 else int(position_ms)))
+        should_pause_after_seek = not self._vlc_playing
+        terminal_state = False
+        try:
+            state = self._vlc_player.get_state()
+        except Exception:
+            state = None
+
+        if vlc is not None and state in (vlc.State.Ended, vlc.State.Stopped):
+            terminal_state = True
+            should_pause_after_seek = True
             try:
+                self._vlc_player.play()
+                QApplication.processEvents()
+            except Exception:
+                pass
+
+        self._vlc_player.set_time(position_ms)
+        self._fallback_position_ms = position_ms
+        self._update_position_labels(self._fallback_position_ms)
+        if should_pause_after_seek:
+            try:
+                self._vlc_player.set_pause(1)
+                self._vlc_playing = False
+                self._set_play_button_state(is_playing=False)
                 self._vlc_player.next_frame()
             except Exception:
                 pass
+        if terminal_state:
+            self._queue_vlc_terminal_seek_retry(position_ms)
         if refresh_thumbnails:
             self._schedule_thumbnail_refresh(position_ms)
+
+    def _queue_vlc_terminal_seek_retry(self, position_ms: int) -> None:
+        self._vlc_terminal_seek_retry_ms = max(0, int(position_ms))
+        if self._vlc_terminal_seek_retry_active:
+            return
+        self._vlc_terminal_seek_retry_active = True
+        QTimer.singleShot(80, self._retry_vlc_terminal_seek)
+
+    def _retry_vlc_terminal_seek(self) -> None:
+        self._vlc_terminal_seek_retry_active = False
+        if not self._vlc_active or self._vlc_player is None or self._vlc_terminal_seek_retry_ms is None:
+            return
+        position_ms = self._vlc_terminal_seek_retry_ms
+        self._vlc_terminal_seek_retry_ms = None
+        try:
+            self._vlc_player.set_time(position_ms)
+            self._fallback_position_ms = position_ms
+            self._update_position_labels(position_ms)
+            if not self._vlc_playing:
+                self._vlc_player.set_pause(1)
+                self._vlc_player.next_frame()
+        except Exception:
+            pass
 
     def _sync_vlc_position(self) -> None:
         if not self._vlc_active or self._vlc_player is None:
@@ -1979,8 +2050,7 @@ class VideoTimeClipper(QMainWindow):
         self.update_actions()
 
     def _on_thumbnail_handle_moved(self, position_ms: int) -> None:
-        self._schedule_player_position(position_ms, refresh_thumbnails=False)
-        self._update_position_labels(position_ms)
+        self._seek_player_position_now(position_ms, refresh_thumbnails=False)
 
     def _on_slider_released(self, slider_value: Optional[int] = None) -> None:
         self._slider_is_pressed = False
