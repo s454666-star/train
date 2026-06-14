@@ -75,6 +75,8 @@ VLC_SCRUB_THROTTLE_MS = 25
 THUMBNAIL_COUNT = 9
 THUMBNAIL_MAX_WIDTH = 180
 THUMBNAIL_MAX_HEIGHT = 76
+THUMBNAIL_REFRESH_DELAY_MS = 80
+THUMBNAIL_HANDLE_THRESHOLD = 28
 SEEK_SLIDER_HIT_HEIGHT = 42
 VIDEO_READ_LOCK = threading.RLock()
 PLAYBACK_CATCHUP_FRAME_LIMIT = 8
@@ -526,7 +528,7 @@ class ThumbnailRangeStrip(QWidget):
         if self.range_start_ms is None or self.range_end_ms is None:
             return None
         start_x, end_x = self._range_pixels()
-        threshold = 16
+        threshold = THUMBNAIL_HANDLE_THRESHOLD
         start_distance = abs(x - start_x)
         end_distance = abs(x - end_x)
         if start_distance <= threshold or end_distance <= threshold:
@@ -556,7 +558,7 @@ class ThumbnailRangeStrip(QWidget):
     def _draw_handle(self, painter: QPainter, x: int, rect: QRect, label: str) -> None:
         painter.setPen(QPen(QColor("#38bdf8"), 3))
         painter.drawLine(x, rect.top(), x, rect.bottom())
-        handle_rect = QRect(x - 8, rect.top(), 16, 18)
+        handle_rect = QRect(x - 11, rect.top(), 22, 20)
         painter.fillRect(handle_rect, QColor("#38bdf8"))
         painter.setPen(QColor("#ffffff"))
         painter.drawText(handle_rect, Qt.AlignCenter, label)
@@ -579,24 +581,88 @@ class ThumbnailWorker(QObject):
             self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
             return
 
-        for index in range(THUMBNAIL_COUNT):
+        positions = self._thumbnail_positions()
+        thumbnails = self._read_thumbnail_sheet(ffmpeg_path, positions)
+        if thumbnails:
+            self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
+            return
+
+        for position_ms in positions:
             if QThread.currentThread().isInterruptionRequested():
                 break
-            if THUMBNAIL_COUNT == 1 or self.view_end_ms <= self.view_start_ms:
-                position_ms = self.view_start_ms
-            else:
-                position_ms = int(
-                    self.view_start_ms
-                    + ((self.view_end_ms - self.view_start_ms) * index) / (THUMBNAIL_COUNT - 1)
-                )
-
             image = read_video_image_with_ffmpeg(
-                self.video_path, position_ms, THUMBNAIL_MAX_WIDTH, timeout=8
+                self.video_path, position_ms, THUMBNAIL_MAX_WIDTH, timeout=2
             )
             if not image.isNull():
                 thumbnails.append((position_ms, image))
 
         self.finished.emit(self.request_id, self.view_start_ms, self.view_end_ms, thumbnails)
+
+    def _thumbnail_positions(self) -> list[int]:
+        if THUMBNAIL_COUNT <= 1 or self.view_end_ms <= self.view_start_ms:
+            return [self.view_start_ms]
+        return [
+            int(self.view_start_ms + ((self.view_end_ms - self.view_start_ms) * index) / (THUMBNAIL_COUNT - 1))
+            for index in range(THUMBNAIL_COUNT)
+        ]
+
+    def _read_thumbnail_sheet(self, ffmpeg_path: str, positions: list[int]) -> list[tuple[int, QImage]]:
+        if not positions:
+            return []
+        duration_ms = max(SLIDER_STEP_MS, self.view_end_ms - self.view_start_ms)
+        duration_sec = max(0.5, duration_ms / 1000)
+        fps_value = THUMBNAIL_COUNT / duration_sec
+        cmd = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-noaccurate_seek",
+            "-ss",
+            f"{max(0, self.view_start_ms) / 1000:.3f}",
+            "-i",
+            self.video_path,
+            "-t",
+            f"{duration_sec:.3f}",
+            "-vf",
+            (
+                f"fps={fps_value:.6f},"
+                f"scale={THUMBNAIL_MAX_WIDTH}:-2:force_original_aspect_ratio=decrease,"
+                f"tile={THUMBNAIL_COUNT}x1:padding=0:margin=0"
+            ),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "3",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=4,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except Exception:
+            return []
+        if result.returncode != 0 or not result.stdout:
+            return []
+        sheet = QImage()
+        if not sheet.loadFromData(result.stdout) or sheet.isNull():
+            return []
+
+        cell_width = max(1, sheet.width() // THUMBNAIL_COUNT)
+        thumbnails: list[tuple[int, QImage]] = []
+        for index, position_ms in enumerate(positions[:THUMBNAIL_COUNT]):
+            cell = sheet.copy(index * cell_width, 0, cell_width, sheet.height())
+            if not cell.isNull():
+                thumbnails.append((position_ms, cell.copy()))
+        return thumbnails
 
 
 class VideoDropFilter(QObject):
@@ -1158,6 +1224,7 @@ class VideoTimeClipper(QMainWindow):
         return max(0, int((max(0, duration_ms) + SLIDER_STEP_MS - 1) // SLIDER_STEP_MS))
 
     def _set_slider_duration(self, duration_ms: int) -> None:
+        previous_duration = self.duration_ms
         self.duration_ms = max(0, int(duration_ms))
         slider_max = self._duration_to_slider_max(self.duration_ms)
         self.seek_slider.setRange(0, slider_max)
@@ -1165,6 +1232,8 @@ class VideoTimeClipper(QMainWindow):
         self.seek_slider.setPageStep(5)
         self.total_time_label.setText(format_time(self.duration_ms))
         self.thumbnail_strip.set_duration(self.duration_ms)
+        if previous_duration <= 0 < self.duration_ms and not self.thumbnail_strip.thumbnails:
+            self._schedule_thumbnail_preview(0)
 
     def _clear_thumbnail_strip(self) -> None:
         self.thumbnail_strip.set_thumbnails([])
@@ -1174,14 +1243,24 @@ class VideoTimeClipper(QMainWindow):
         if not self.video_path or self.pending_start_ms is None or self.pending_end_ms is None:
             return
         self._thumbnail_pending_center_ms = self.current_position_ms() if center_ms is None else max(0, int(center_ms))
-        self.thumbnail_timer.start(350)
+        view_start_ms, view_end_ms = self._thumbnail_view_window()
+        self.thumbnail_strip.set_view(view_start_ms, view_end_ms)
+        self.thumbnail_strip.set_range(self.pending_start_ms, self.pending_end_ms)
+        self.thumbnail_timer.start(THUMBNAIL_REFRESH_DELAY_MS)
+
+    def _schedule_thumbnail_preview(self, center_ms: Optional[int] = None) -> None:
+        if not self.video_path or self.duration_ms <= 0:
+            return
+        self._thumbnail_pending_center_ms = self.current_position_ms() if center_ms is None else max(0, int(center_ms))
+        view_start_ms, view_end_ms = self._thumbnail_view_window()
+        self.thumbnail_strip.set_view(view_start_ms, view_end_ms)
+        self.thumbnail_strip.set_range(self.pending_start_ms, self.pending_end_ms)
+        self.thumbnail_timer.start(THUMBNAIL_REFRESH_DELAY_MS)
 
     def _refresh_thumbnail_strip(self) -> None:
         if (
             not self.video_path
-            or cv2 is None
-            or self.pending_start_ms is None
-            or self.pending_end_ms is None
+            or self.duration_ms <= 0
         ):
             return
 
@@ -1236,7 +1315,7 @@ class VideoTimeClipper(QMainWindow):
             self._thumbnail_thread.requestInterruption()
             self._thumbnail_thread.quit()
             if wait:
-                self._thumbnail_thread.wait(1500)
+                self._thumbnail_thread.wait(6500)
                 if not self._thumbnail_thread.isRunning():
                     self._thumbnail_refresh_running = False
                     self._thumbnail_thread = None
