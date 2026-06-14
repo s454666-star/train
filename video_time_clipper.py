@@ -8,10 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QEvent, QObject, Qt, QTimer, QUrl, pyqtSignal
+from PyQt5.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon, QImage, QKeySequence, QPixmap
-from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
-from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -28,7 +26,6 @@ from PyQt5.QtWidgets import (
     QShortcut,
     QSizePolicy,
     QSlider,
-    QStackedLayout,
     QStyle,
     QVBoxLayout,
     QWidget,
@@ -41,6 +38,7 @@ except ImportError:  # pragma: no cover - only used on machines without OpenCV.
 
 
 VIDEO_FILTER = "影片檔案 (*.mp4 *.mkv *.mov *.avi *.wmv *.m4v);;所有檔案 (*.*)"
+SLIDER_STEP_MS = 1000
 
 
 @dataclass(frozen=True)
@@ -126,8 +124,8 @@ class VideoTimeClipper(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("影片時間擷取複製工具")
-        self.resize(1180, 760)
-        self.setMinimumSize(920, 620)
+        self.resize(1320, 820)
+        self.setMinimumSize(860, 560)
         self.setAcceptDrops(True)
 
         self.video_path: Optional[str] = None
@@ -135,17 +133,13 @@ class VideoTimeClipper(QMainWindow):
         self.pending_start_ms: Optional[int] = None
         self.pending_end_ms: Optional[int] = None
         self._slider_is_pressed = False
-        self._auto_play_requested = False
-        self._qt_media_started = False
+        self._resume_after_slider = False
         self._fallback_active = False
         self._fallback_playing = False
         self._fallback_capture = None
         self._fallback_fps = 30.0
         self._fallback_position_ms = 0
 
-        self.player = QMediaPlayer(self, QMediaPlayer.VideoSurface)
-        self.video_widget = QVideoWidget(self)
-        self.player.setVideoOutput(self.video_widget)
         self.fallback_timer = QTimer(self)
         self.fallback_timer.timeout.connect(self._render_fallback_frame)
 
@@ -164,8 +158,8 @@ class VideoTimeClipper(QMainWindow):
         central.setAcceptDrops(True)
         central.installEventFilter(self.drop_filter)
         root = QHBoxLayout(central)
-        root.setContentsMargins(18, 18, 18, 18)
-        root.setSpacing(16)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
 
         player_panel = QFrame(self)
         player_panel.setObjectName("playerPanel")
@@ -173,35 +167,21 @@ class VideoTimeClipper(QMainWindow):
         player_layout.setContentsMargins(0, 0, 0, 0)
         player_layout.setSpacing(0)
 
-        self.video_widget.setObjectName("videoSurface")
-        self.video_widget.setAcceptDrops(True)
-        self.video_widget.installEventFilter(self.drop_filter)
-        self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
         self.frame_label = QLabel("拖曳影片到這裡")
         self.frame_label.setObjectName("videoSurface")
         self.frame_label.setAlignment(Qt.AlignCenter)
         self.frame_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.frame_label.setAcceptDrops(True)
         self.frame_label.installEventFilter(self.drop_filter)
-
-        self.video_stack_host = QWidget(self)
-        self.video_stack_host.setObjectName("videoSurface")
-        self.video_stack_host.setAcceptDrops(True)
-        self.video_stack_host.installEventFilter(self.drop_filter)
-        self.video_stack = QStackedLayout(self.video_stack_host)
-        self.video_stack.setContentsMargins(0, 0, 0, 0)
-        self.video_stack.addWidget(self.video_widget)
-        self.video_stack.addWidget(self.frame_label)
-        player_layout.addWidget(self.video_stack_host, stretch=1)
+        player_layout.addWidget(self.frame_label, stretch=1)
 
         controls = QFrame(self)
         controls.setObjectName("controls")
         controls.setAcceptDrops(True)
         controls.installEventFilter(self.drop_filter)
         controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(18, 14, 18, 16)
-        controls_layout.setSpacing(12)
+        controls_layout.setContentsMargins(12, 9, 12, 10)
+        controls_layout.setSpacing(7)
 
         self.file_label = QLabel("拖曳影片到這裡，或按「開啟影片」")
         self.file_label.setObjectName("fileLabel")
@@ -213,6 +193,10 @@ class VideoTimeClipper(QMainWindow):
         self.current_time_label.setObjectName("timeLabel")
         self.seek_slider = ClickableSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 0)
+        self.seek_slider.setSingleStep(1)
+        self.seek_slider.setPageStep(5)
+        self.seek_slider.setTracking(True)
+        self.seek_slider.setToolTip("拖曳可逐秒掃描畫面")
         self.total_time_label = QLabel("0:00")
         self.total_time_label.setObjectName("timeLabel")
         timeline.addWidget(self.current_time_label)
@@ -243,19 +227,20 @@ class VideoTimeClipper(QMainWindow):
         side_panel.setObjectName("sidePanel")
         side_panel.setAcceptDrops(True)
         side_panel.installEventFilter(self.drop_filter)
+        side_panel.setFixedWidth(230)
         side_layout = QVBoxLayout(side_panel)
-        side_layout.setContentsMargins(18, 18, 18, 18)
-        side_layout.setSpacing(14)
+        side_layout.setContentsMargins(10, 10, 10, 10)
+        side_layout.setSpacing(8)
 
         title = QLabel("時間段")
         title.setObjectName("panelTitle")
-        subtitle = QLabel("設定開始和結束後加入清單，可一次複製多段。")
+        subtitle = QLabel("多段擷取")
         subtitle.setObjectName("panelSubtitle")
         subtitle.setWordWrap(True)
 
         capture_grid = QGridLayout()
-        capture_grid.setHorizontalSpacing(10)
-        capture_grid.setVerticalSpacing(10)
+        capture_grid.setHorizontalSpacing(6)
+        capture_grid.setVerticalSpacing(6)
         start_caption = QLabel("開始")
         start_caption.setObjectName("caption")
         end_caption = QLabel("結束")
@@ -315,8 +300,8 @@ class VideoTimeClipper(QMainWindow):
         side_layout.addWidget(self.copy_button)
         side_layout.addWidget(self.status_label)
 
-        root.addWidget(player_panel, stretch=3)
-        root.addWidget(side_panel, stretch=1)
+        root.addWidget(player_panel, stretch=8)
+        root.addWidget(side_panel, stretch=0)
         self.setCentralWidget(central)
 
         self.open_button.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
@@ -364,16 +349,10 @@ class VideoTimeClipper(QMainWindow):
         self.delete_segment_button.clicked.connect(self.delete_selected_segments)
         self.clear_segments_button.clicked.connect(self.clear_segments)
 
-        self.player.durationChanged.connect(self.on_duration_changed)
-        self.player.positionChanged.connect(self.on_position_changed)
-        self.player.stateChanged.connect(self.on_state_changed)
-        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
-        self.player.error.connect(self.on_player_error)
-
         self.seek_slider.sliderPressed.connect(self._on_slider_pressed)
         self.seek_slider.sliderReleased.connect(self._on_slider_released)
-        self.seek_slider.sliderMoved.connect(self.set_player_position)
-        self.seek_slider.clickedValue.connect(self.set_player_position)
+        self.seek_slider.sliderMoved.connect(self._on_slider_moved)
+        self.seek_slider.clickedValue.connect(self._on_slider_clicked)
         self.segment_list.itemSelectionChanged.connect(self.update_actions)
         self.segment_list.itemDoubleClicked.connect(self.seek_to_segment_start)
 
@@ -396,7 +375,7 @@ class VideoTimeClipper(QMainWindow):
                 border: 1px solid #273247;
                 border-radius: 8px;
             }
-            QWidget#videoSurface, QVideoWidget#videoSurface, QLabel#videoSurface {
+            QWidget#videoSurface, QLabel#videoSurface {
                 background: #05070d;
                 border-top-left-radius: 8px;
                 border-top-right-radius: 8px;
@@ -421,50 +400,53 @@ class VideoTimeClipper(QMainWindow):
             }
             QLabel#panelTitle {
                 color: #f9fafb;
-                font-size: 24px;
+                font-size: 18px;
                 font-weight: 700;
             }
             QLabel#panelSubtitle, QLabel#statusLabel {
                 color: #9ca3af;
+                font-size: 11px;
             }
             QLabel#caption {
                 color: #93c5fd;
                 font-weight: 700;
+                font-size: 11px;
             }
             QLabel#captureValue {
                 color: #ffffff;
                 background: #0f172a;
                 border: 1px solid #334155;
-                border-radius: 6px;
-                padding: 8px 10px;
-                font-size: 17px;
+                border-radius: 5px;
+                padding: 5px 6px;
+                font-size: 14px;
                 font-weight: 700;
                 font-variant-numeric: tabular-nums;
-                min-width: 88px;
+                min-width: 72px;
             }
             QLabel#outputPreview {
                 color: #dbeafe;
                 background: #0f172a;
                 border: 1px solid #334155;
                 border-radius: 6px;
-                padding: 10px;
-                min-height: 72px;
+                padding: 7px;
+                min-height: 52px;
                 font-family: Consolas, "Microsoft JhengHei UI";
+                font-size: 11px;
             }
             QListWidget#segmentList {
                 color: #e5e7eb;
                 background: #0f172a;
                 border: 1px solid #334155;
                 border-radius: 7px;
-                padding: 6px;
+                padding: 4px;
                 outline: 0;
-                font-size: 16px;
+                font-size: 13px;
                 font-variant-numeric: tabular-nums;
             }
             QListWidget#segmentList::item {
-                padding: 9px 10px;
+                padding: 6px 7px;
                 border-radius: 5px;
-                margin: 2px;
+                margin: 1px;
             }
             QListWidget#segmentList::item:selected {
                 background: #2563eb;
@@ -475,8 +457,9 @@ class VideoTimeClipper(QMainWindow):
                 background: #25324a;
                 border: 1px solid #3b4b68;
                 border-radius: 6px;
-                padding: 9px 12px;
+                padding: 7px 8px;
                 font-weight: 650;
+                font-size: 12px;
             }
             QPushButton:hover:!disabled {
                 background: #30415f;
@@ -494,8 +477,8 @@ class VideoTimeClipper(QMainWindow):
                 background: #16a34a;
                 border-color: #22c55e;
                 color: #ffffff;
-                font-size: 16px;
-                padding: 12px;
+                font-size: 14px;
+                padding: 9px;
             }
             QPushButton#primaryButton:hover:!disabled {
                 background: #15803d;
@@ -531,41 +514,67 @@ class VideoTimeClipper(QMainWindow):
             return
 
         self._stop_fallback_playback()
-        self.player.stop()
         self.video_path = os.path.abspath(path)
         self.pending_start_ms = None
         self.pending_end_ms = None
         self.segment_list.clear()
         self.duration_ms = 0
         self._fallback_position_ms = 0
-        self._auto_play_requested = True
-        self._qt_media_started = False
-        self.video_stack.setCurrentWidget(self.video_widget)
         self.frame_label.setText("正在載入影片...")
 
-        self.player.setMedia(QMediaContent(QUrl.fromLocalFile(self.video_path)))
         self.file_label.setText(self.video_path)
-        self.status_label.setText("正在載入影片，載入完成會自動播放")
+        self.status_label.setText("正在載入影片")
         self.play_button.setEnabled(True)
         self.rewind_button.setEnabled(True)
         self.forward_button.setEnabled(True)
         self.set_start_button.setEnabled(True)
         self.set_end_button.setEnabled(True)
         self.seek_slider.setRange(0, 0)
+        self.seek_slider.setSingleStep(1)
+        self.seek_slider.setPageStep(5)
         self.current_time_label.setText("0:00")
         self.total_time_label.setText("0:00")
         self._refresh_capture_labels()
         self.update_actions()
 
-        QTimer.singleShot(0, self._request_qt_play)
-        QTimer.singleShot(450, self._request_qt_play)
-        QTimer.singleShot(1400, self._request_qt_play)
-        QTimer.singleShot(2200, self._fallback_if_qt_stalled)
+        QTimer.singleShot(0, lambda: self._start_fallback_playback("逐秒掃描播放模式已啟動"))
 
     def current_position_ms(self) -> int:
         if self._fallback_active:
             return int(self._fallback_position_ms)
-        return int(self.player.position())
+        return 0
+
+    def _slider_value_to_ms(self, slider_value: int) -> int:
+        return max(0, int(slider_value) * SLIDER_STEP_MS)
+
+    def _position_to_slider_value(self, position_ms: int) -> int:
+        return max(0, int(position_ms) // SLIDER_STEP_MS)
+
+    def _duration_to_slider_max(self, duration_ms: int) -> int:
+        return max(0, int((max(0, duration_ms) + SLIDER_STEP_MS - 1) // SLIDER_STEP_MS))
+
+    def _set_slider_duration(self, duration_ms: int) -> None:
+        self.duration_ms = max(0, int(duration_ms))
+        self.seek_slider.setRange(0, self._duration_to_slider_max(self.duration_ms))
+        self.seek_slider.setSingleStep(1)
+        self.seek_slider.setPageStep(5)
+        self.total_time_label.setText(format_time(self.duration_ms))
+
+    def _is_currently_playing(self) -> bool:
+        if self._fallback_active:
+            return self._fallback_playing
+        return False
+
+    def _pause_for_slider_scan(self) -> None:
+        if self._fallback_active:
+            self._pause_fallback_playback()
+
+    def _resume_after_slider_scan(self) -> None:
+        if not self._resume_after_slider:
+            return
+        self._resume_after_slider = False
+        if self._fallback_active:
+            self._resume_fallback_playback()
 
     def set_player_position(self, position_ms: int) -> None:
         upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
@@ -573,19 +582,7 @@ class VideoTimeClipper(QMainWindow):
         if self._fallback_active:
             self._seek_fallback(position_ms)
             return
-        self.player.setPosition(position_ms)
-
-    def _request_qt_play(self) -> None:
-        if not self.video_path or self._fallback_active:
-            return
-        self.player.play()
-
-    def _fallback_if_qt_stalled(self) -> None:
-        if not self.video_path or self._fallback_active:
-            return
-        if self.player.state() == QMediaPlayer.PlayingState and self.player.duration() > 0:
-            return
-        self._start_fallback_playback("Qt 播放器尚未開始，已切換相容播放模式")
+        self._update_position_labels(position_ms)
 
     def _start_fallback_playback(self, reason: str) -> None:
         if self._fallback_active or not self.video_path:
@@ -599,8 +596,6 @@ class VideoTimeClipper(QMainWindow):
             self.status_label.setText(f"{reason}，但相容模式也無法開啟這支影片。")
             return
 
-        self.player.stop()
-        self.video_stack.setCurrentWidget(self.frame_label)
         self._fallback_capture = capture
         self._fallback_active = True
         self._fallback_playing = True
@@ -613,11 +608,9 @@ class VideoTimeClipper(QMainWindow):
 
         frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if frame_count > 0 and self.duration_ms <= 0:
-            self.duration_ms = int((frame_count / fps) * 1000)
-            self.seek_slider.setRange(0, self.duration_ms)
-            self.total_time_label.setText(format_time(self.duration_ms))
+            self._set_slider_duration(int((frame_count / fps) * 1000))
 
-        self.status_label.setText(f"{reason}（此模式重點是畫面與時間擷取，音訊由 Qt 後端支援時才有）")
+        self.status_label.setText(reason)
         self._set_play_button_state(is_playing=True)
         self._render_fallback_frame()
         interval_ms = max(15, min(80, int(1000 / self._fallback_fps)))
@@ -687,7 +680,7 @@ class VideoTimeClipper(QMainWindow):
 
     def _update_position_labels(self, position_ms: int) -> None:
         if not self._slider_is_pressed:
-            self.seek_slider.setValue(position_ms)
+            self.seek_slider.setValue(self._position_to_slider_value(position_ms))
         self.current_time_label.setText(format_time(position_ms))
 
     def _set_play_button_state(self, is_playing: bool) -> None:
@@ -707,10 +700,6 @@ class VideoTimeClipper(QMainWindow):
             else:
                 self._resume_fallback_playback()
             return
-        if self.player.state() == QMediaPlayer.PlayingState:
-            self.player.pause()
-        else:
-            self.player.play()
 
     def seek_relative(self, delta_ms: int) -> None:
         if not self.video_path:
@@ -794,63 +783,35 @@ class VideoTimeClipper(QMainWindow):
 
     def _on_slider_pressed(self) -> None:
         self._slider_is_pressed = True
+        self._resume_after_slider = self._is_currently_playing()
+        self._pause_for_slider_scan()
+
+    def _set_slider_value_without_feedback(self, slider_value: int) -> None:
+        if self.seek_slider.value() == slider_value:
+            return
+        self.seek_slider.blockSignals(True)
+        self.seek_slider.setValue(slider_value)
+        self.seek_slider.blockSignals(False)
+
+    def _on_slider_moved(self, slider_value: int) -> None:
+        self._set_slider_value_without_feedback(slider_value)
+        target_ms = self._slider_value_to_ms(slider_value)
+        self.set_player_position(target_ms)
+        self.current_time_label.setText(format_time(target_ms))
+
+    def _on_slider_clicked(self, slider_value: int) -> None:
+        self._set_slider_value_without_feedback(slider_value)
+        target_ms = self._slider_value_to_ms(slider_value)
+        self.set_player_position(target_ms)
+        self.current_time_label.setText(format_time(target_ms))
 
     def _on_slider_released(self) -> None:
         self._slider_is_pressed = False
-        self.set_player_position(self.seek_slider.value())
-
-    def on_duration_changed(self, duration: int) -> None:
-        if self._fallback_active:
-            return
-        self.duration_ms = max(0, duration)
-        self.seek_slider.setRange(0, self.duration_ms)
-        self.total_time_label.setText(format_time(self.duration_ms))
-
-    def on_position_changed(self, position: int) -> None:
-        if self._fallback_active:
-            return
-        self._update_position_labels(position)
-
-    def on_state_changed(self, state: QMediaPlayer.State) -> None:
-        if self._fallback_active:
-            return
-        if state == QMediaPlayer.PlayingState:
-            self._qt_media_started = True
-            self._auto_play_requested = False
-            self.status_label.setText("正在播放")
-            self._set_play_button_state(is_playing=True)
-        else:
-            self._set_play_button_state(is_playing=False)
-
-    def on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
-        if self._fallback_active:
-            return
-        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
-            if self.player.duration() > 0 and self.duration_ms <= 0:
-                self.on_duration_changed(self.player.duration())
-            self.status_label.setText("影片已載入，正在開始播放")
-            if self._auto_play_requested:
-                self._request_qt_play()
-        elif status == QMediaPlayer.LoadingMedia:
-            self.status_label.setText("正在載入影片，載入完成會自動播放")
-        elif status == QMediaPlayer.StalledMedia:
-            self.status_label.setText("影片載入暫停，正在嘗試相容播放")
-            self._start_fallback_playback("Qt 播放器載入暫停")
-        elif status == QMediaPlayer.InvalidMedia:
-            self._start_fallback_playback("Qt 播放器無法讀取此影片")
-
-    def on_player_error(self) -> None:
-        error_text = self.player.errorString() or "播放時發生錯誤。"
-        if self._fallback_active:
-            return
-        if self.video_path and not self._fallback_active:
-            self._start_fallback_playback(f"Qt 播放器錯誤：{error_text}")
-        else:
-            self.status_label.setText(error_text)
+        self.set_player_position(self._slider_value_to_ms(self.seek_slider.value()))
+        self._resume_after_slider_scan()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
         self._stop_fallback_playback()
-        self.player.stop()
         super().closeEvent(event)
 
     def update_actions(self) -> None:
