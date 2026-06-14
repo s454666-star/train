@@ -71,6 +71,7 @@ WINDOWS_APP_ID = "Star.VideoTimeClipper"
 SLIDER_STEP_MS = 1000
 PLAYBACK_MAX_FPS = 24.0
 SEEK_DEBOUNCE_MS = 45
+VLC_SCRUB_THROTTLE_MS = 25
 THUMBNAIL_COUNT = 9
 THUMBNAIL_MAX_WIDTH = 180
 THUMBNAIL_MAX_HEIGHT = 76
@@ -682,9 +683,15 @@ class VideoTimeClipper(QMainWindow):
         self.fallback_timer.timeout.connect(self._render_fallback_frame)
         self.vlc_timer = QTimer(self)
         self.vlc_timer.timeout.connect(self._sync_vlc_position)
+        self.vlc_scrub_timer = QTimer(self)
+        self.vlc_scrub_timer.setSingleShot(True)
+        self.vlc_scrub_timer.timeout.connect(self._apply_pending_vlc_scrub)
         self.seek_timer = QTimer(self)
         self.seek_timer.setSingleShot(True)
         self.seek_timer.timeout.connect(self._apply_pending_seek)
+        self._pending_vlc_scrub_ms: Optional[int] = None
+        self._pending_vlc_scrub_refresh_thumbnails = False
+        self._last_vlc_scrub_at = 0.0
         self._pending_seek_ms: Optional[int] = None
         self._pending_seek_refresh_thumbnails = False
         self.thumbnail_timer = QTimer(self)
@@ -1265,7 +1272,7 @@ class VideoTimeClipper(QMainWindow):
 
     def _pause_for_slider_scan(self) -> None:
         if self._vlc_active:
-            self._pause_vlc_playback()
+            return
         elif self._fallback_active:
             self._pause_fallback_playback()
 
@@ -1280,9 +1287,35 @@ class VideoTimeClipper(QMainWindow):
 
     def _schedule_player_position(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
         upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
+        if self._vlc_active:
+            self._schedule_vlc_scrub(
+                max(0, min(int(position_ms), upper_bound)),
+                refresh_thumbnails=refresh_thumbnails,
+            )
+            return
         self._pending_seek_ms = max(0, min(int(position_ms), upper_bound))
         self._pending_seek_refresh_thumbnails = refresh_thumbnails
         self.seek_timer.start(SEEK_DEBOUNCE_MS)
+
+    def _schedule_vlc_scrub(self, position_ms: int, refresh_thumbnails: bool = False) -> None:
+        self._pending_vlc_scrub_ms = int(position_ms)
+        self._pending_vlc_scrub_refresh_thumbnails = self._pending_vlc_scrub_refresh_thumbnails or refresh_thumbnails
+        elapsed_ms = (time.perf_counter() - self._last_vlc_scrub_at) * 1000
+        if elapsed_ms >= VLC_SCRUB_THROTTLE_MS:
+            self._apply_pending_vlc_scrub()
+            return
+        if not self.vlc_scrub_timer.isActive():
+            self.vlc_scrub_timer.start(max(1, int(VLC_SCRUB_THROTTLE_MS - elapsed_ms)))
+
+    def _apply_pending_vlc_scrub(self) -> None:
+        if self._pending_vlc_scrub_ms is None:
+            return
+        position_ms = self._pending_vlc_scrub_ms
+        refresh_thumbnails = self._pending_vlc_scrub_refresh_thumbnails
+        self._pending_vlc_scrub_ms = None
+        self._pending_vlc_scrub_refresh_thumbnails = False
+        self._last_vlc_scrub_at = time.perf_counter()
+        self._seek_vlc(position_ms, refresh_thumbnails=refresh_thumbnails)
 
     def _apply_pending_seek(self) -> None:
         if self._pending_seek_ms is None:
@@ -1314,6 +1347,7 @@ class VideoTimeClipper(QMainWindow):
                     "--no-video-title-show",
                     "--avcodec-hw=any",
                     "--file-caching=220",
+                    "--input-fast-seek",
                     "--drop-late-frames",
                     "--skip-frames",
                 )
@@ -1323,6 +1357,7 @@ class VideoTimeClipper(QMainWindow):
             self._show_safe_preview_frame(0)
             media = self._vlc_instance.media_new(self.video_path)
             media.add_option(":file-caching=220")
+            media.add_option(":input-fast-seek")
             player = self._vlc_instance.media_player_new()
             player.set_media(media)
             player.set_hwnd(int(self.frame_label.winId()))
@@ -1380,6 +1415,11 @@ class VideoTimeClipper(QMainWindow):
         self._vlc_player.set_time(max(0, int(position_ms)))
         self._fallback_position_ms = max(0, int(position_ms))
         self._update_position_labels(self._fallback_position_ms)
+        if not self._vlc_playing:
+            try:
+                self._vlc_player.next_frame()
+            except Exception:
+                pass
         if refresh_thumbnails:
             self._schedule_thumbnail_refresh(position_ms)
 
@@ -1833,7 +1873,10 @@ class VideoTimeClipper(QMainWindow):
         if slider_value is not None:
             self._set_slider_value_without_feedback(slider_value)
         self.seek_timer.stop()
+        self.vlc_scrub_timer.stop()
         self._pending_seek_ms = None
+        self._pending_vlc_scrub_ms = None
+        self._pending_vlc_scrub_refresh_thumbnails = False
         self.set_player_position(self._slider_value_to_ms(self.seek_slider.value()))
         self._resume_after_slider_scan()
 
