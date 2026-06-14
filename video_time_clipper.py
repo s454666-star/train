@@ -59,21 +59,51 @@ class ClipSegment:
 class ClickableSlider(QSlider):
     """Slider that seeks to the clicked position instead of only dragging."""
 
-    clickedValue = pyqtSignal(int)
+    scanStarted = pyqtSignal()
+    scanMoved = pyqtSignal(int)
+    scanFinished = pyqtSignal(int)
+
+    def _value_from_event(self, event) -> int:
+        if self.orientation() == Qt.Horizontal:
+            ratio = event.x() / max(1, self.width() - 1)
+        else:
+            ratio = 1 - (event.y() / max(1, self.height() - 1))
+        ratio = max(0.0, min(1.0, ratio))
+        value = round(self.minimum() + ratio * (self.maximum() - self.minimum()))
+        return max(self.minimum(), min(self.maximum(), value))
+
+    def _move_to_event_position(self, event) -> int:
+        value = self._value_from_event(event)
+        self.setSliderPosition(value)
+        self.setValue(value)
+        return value
 
     def mousePressEvent(self, event):  # noqa: N802 - Qt override name
         if event.button() == Qt.LeftButton and self.maximum() > self.minimum():
-            if self.orientation() == Qt.Horizontal:
-                ratio = event.x() / max(1, self.width())
-            else:
-                ratio = 1 - (event.y() / max(1, self.height()))
-            value = round(self.minimum() + ratio * (self.maximum() - self.minimum()))
-            value = max(self.minimum(), min(self.maximum(), value))
-            self.setValue(value)
-            self.clickedValue.emit(value)
+            self.setSliderDown(True)
+            self.scanStarted.emit()
+            value = self._move_to_event_position(event)
+            self.scanMoved.emit(value)
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):  # noqa: N802 - Qt override name
+        if self.isSliderDown() and event.buttons() & Qt.LeftButton and self.maximum() > self.minimum():
+            value = self._move_to_event_position(event)
+            self.scanMoved.emit(value)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):  # noqa: N802 - Qt override name
+        if event.button() == Qt.LeftButton and self.isSliderDown():
+            value = self._move_to_event_position(event)
+            self.setSliderDown(False)
+            self.scanFinished.emit(value)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class VideoDropFilter(QObject):
@@ -349,10 +379,9 @@ class VideoTimeClipper(QMainWindow):
         self.delete_segment_button.clicked.connect(self.delete_selected_segments)
         self.clear_segments_button.clicked.connect(self.clear_segments)
 
-        self.seek_slider.sliderPressed.connect(self._on_slider_pressed)
-        self.seek_slider.sliderReleased.connect(self._on_slider_released)
-        self.seek_slider.sliderMoved.connect(self._on_slider_moved)
-        self.seek_slider.clickedValue.connect(self._on_slider_clicked)
+        self.seek_slider.scanStarted.connect(self._on_slider_pressed)
+        self.seek_slider.scanMoved.connect(self._on_slider_moved)
+        self.seek_slider.scanFinished.connect(self._on_slider_released)
         self.segment_list.itemSelectionChanged.connect(self.update_actions)
         self.segment_list.itemDoubleClicked.connect(self.seek_to_segment_start)
 
@@ -805,8 +834,10 @@ class VideoTimeClipper(QMainWindow):
         self.set_player_position(target_ms)
         self.current_time_label.setText(format_time(target_ms))
 
-    def _on_slider_released(self) -> None:
+    def _on_slider_released(self, slider_value: Optional[int] = None) -> None:
         self._slider_is_pressed = False
+        if slider_value is not None:
+            self._set_slider_value_without_feedback(slider_value)
         self.set_player_position(self._slider_value_to_ms(self.seek_slider.value()))
         self._resume_after_slider_scan()
 
