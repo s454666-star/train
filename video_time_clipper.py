@@ -1251,7 +1251,11 @@ class VideoTimeClipper(QMainWindow):
             with VIDEO_READ_LOCK:
                 capture, backend_name = open_video_reader(self.video_path)
         except Exception as exc:
-            self.status_label.setText(f"{reason}，但相容模式也無法開啟這支影片：{exc}")
+            message = f"{reason}，但相容模式也無法開啟這支影片：{exc}"
+            self.frame_label.clear()
+            self.frame_label.setText("無法播放這支影片")
+            self.status_label.setText(message)
+            self._set_play_button_state(is_playing=False)
             return
 
         self._fallback_capture = capture
