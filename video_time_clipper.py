@@ -843,6 +843,8 @@ class VideoTimeClipper(QMainWindow):
         self._mpv_ipc_stop = threading.Event()
         self._mpv_active = False
         self._mpv_playing = False
+        self._mpv_ack_count = 0
+        self._mpv_last_command_error = ""
 
         self.fallback_timer = QTimer(self)
         self.fallback_timer.timeout.connect(self._render_fallback_frame)
@@ -1592,6 +1594,8 @@ class VideoTimeClipper(QMainWindow):
         pipe_name = rf"\\.\pipe\video-time-clipper-{uuid.uuid4().hex}"
         self._mpv_command_queue = queue.Queue()
         self._mpv_ipc_stop = threading.Event()
+        self._mpv_ack_count = 0
+        self._mpv_last_command_error = ""
         args = [
             mpv_path,
             "--no-config",
@@ -1654,44 +1658,25 @@ class VideoTimeClipper(QMainWindow):
         self._mpv_pipe_name = ""
         self._mpv_active = False
         self._mpv_playing = False
-        self._mpv_ipc_stop.set()
         try:
+            self._mpv_command_queue.put_nowait(["quit"])
             self._mpv_command_queue.put_nowait(None)
         except Exception:
             pass
         if process is None:
-            if ipc_file is not None:
-                threading.Thread(
-                    target=self._close_mpv_ipc_file,
-                    args=(ipc_file,),
-                    name="VideoTimeClipperMpvIpcClose",
-                    daemon=True,
-                ).start()
+            self._mpv_ipc_stop.set()
             return
         threading.Thread(
             target=self._terminate_mpv_process,
-            args=(process, ipc_file),
+            args=(process, self._mpv_ipc_stop),
             name="VideoTimeClipperMpvStop",
             daemon=True,
         ).start()
 
     @staticmethod
-    def _close_mpv_ipc_file(ipc_file) -> None:
+    def _terminate_mpv_process(process: subprocess.Popen, stop_event: threading.Event) -> None:
         try:
-            ipc_file.close()
-        except Exception:
-            pass
-
-    @staticmethod
-    def _terminate_mpv_process(process: subprocess.Popen, ipc_file=None) -> None:
-        if ipc_file is not None:
-            try:
-                if process.poll() is None:
-                    ipc_file.write((json.dumps({"command": ["quit"]}) + "\n").encode("utf-8"))
-            except Exception:
-                pass
-        try:
-            process.wait(timeout=1)
+            process.wait(timeout=1.5)
         except Exception:
             try:
                 process.terminate()
@@ -1701,23 +1686,26 @@ class VideoTimeClipper(QMainWindow):
                     process.kill()
                 except Exception:
                     pass
-        if ipc_file is not None:
-            try:
-                ipc_file.close()
-            except Exception:
-                pass
+        stop_event.set()
 
     def _start_mpv_ipc_connector(self, process: subprocess.Popen, pipe_name: str) -> None:
         threading.Thread(
-            target=self._connect_mpv_ipc_background,
-            args=(process, pipe_name),
-            name="VideoTimeClipperMpvIpcConnect",
+            target=self._run_mpv_ipc_worker,
+            args=(process, pipe_name, self._mpv_command_queue, self._mpv_ipc_stop),
+            name="VideoTimeClipperMpvIpc",
             daemon=True,
         ).start()
 
-    def _connect_mpv_ipc_background(self, process: subprocess.Popen, pipe_name: str) -> None:
+    def _run_mpv_ipc_worker(
+        self,
+        process: subprocess.Popen,
+        pipe_name: str,
+        command_queue: queue.Queue,
+        stop_event: threading.Event,
+    ) -> None:
+        ipc_file = None
         deadline = time.perf_counter() + 5.0
-        while time.perf_counter() < deadline:
+        while not stop_event.is_set() and time.perf_counter() < deadline:
             if process.poll() is not None:
                 return
             try:
@@ -1734,45 +1722,52 @@ class VideoTimeClipper(QMainWindow):
                         pass
                     return
                 self._mpv_ipc_file = ipc_file
-            threading.Thread(
-                target=self._write_mpv_ipc_commands,
-                args=(ipc_file, self._mpv_command_queue, self._mpv_ipc_stop),
-                name="VideoTimeClipperMpvIpcWrite",
-                daemon=True,
-            ).start()
-            threading.Thread(
-                target=self._drain_mpv_ipc,
-                args=(ipc_file,),
-                name="VideoTimeClipperMpvIpcDrain",
-                daemon=True,
-            ).start()
+            break
+        if ipc_file is None:
             return
 
-    @staticmethod
-    def _write_mpv_ipc_commands(ipc_file, command_queue: queue.Queue, stop_event: threading.Event) -> None:
-        while not stop_event.is_set():
-            try:
-                command = command_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if command is None:
-                return
-            try:
-                ipc_file.write((json.dumps({"command": command}) + "\n").encode("utf-8"))
-            except Exception:
-                return
-
-    @staticmethod
-    def _drain_mpv_ipc(ipc_file) -> None:
+        request_id = 0
         try:
-            while True:
-                line = ipc_file.readline()
-                if not line:
+            while not stop_event.is_set():
+                try:
+                    command = command_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if process.poll() is not None:
+                        return
+                    continue
+                if command is None:
                     return
-        except Exception:
-            return
+                request_id += 1
+                message = json.dumps({"command": command, "request_id": request_id}) + "\n"
+                try:
+                    ipc_file.write(message.encode("utf-8"))
+                except Exception:
+                    return
+                while not stop_event.is_set():
+                    try:
+                        line = ipc_file.readline()
+                    except Exception:
+                        return
+                    if not line:
+                        return
+                    try:
+                        response = json.loads(line.decode("utf-8", "ignore"))
+                    except json.JSONDecodeError:
+                        continue
+                    if response.get("request_id") == request_id:
+                        self._mpv_ack_count += 1
+                        self._mpv_last_command_error = str(response.get("error", ""))
+                        break
+        finally:
+            with self._mpv_ipc_lock:
+                if self._mpv_ipc_file is ipc_file:
+                    self._mpv_ipc_file = None
+            try:
+                ipc_file.close()
+            except Exception:
+                pass
 
-    def _send_mpv_command(self, command: str) -> bool:
+    def _send_mpv_command(self, command: list) -> bool:
         if not self._mpv_active:
             return False
         try:
