@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt5.QtCore import QEvent, QObject, Qt, QTimer, QUrl, pyqtSignal
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon, QKeySequence
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QFont, QIcon, QImage, QKeySequence, QPixmap
 from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 from PyQt5.QtWidgets import (
@@ -28,10 +28,16 @@ from PyQt5.QtWidgets import (
     QShortcut,
     QSizePolicy,
     QSlider,
+    QStackedLayout,
     QStyle,
     QVBoxLayout,
     QWidget,
 )
+
+try:
+    import cv2
+except ImportError:  # pragma: no cover - only used on machines without OpenCV.
+    cv2 = None
 
 
 VIDEO_FILTER = "影片檔案 (*.mp4 *.mkv *.mov *.avi *.wmv *.m4v);;所有檔案 (*.*)"
@@ -76,7 +82,7 @@ class VideoDropFilter(QObject):
     dropped = pyqtSignal(str)
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt override name
-        if event.type() == QEvent.DragEnter:
+        if event.type() in (QEvent.DragEnter, QEvent.DragMove):
             drag_event: QDragEnterEvent = event
             if drag_event.mimeData().hasUrls():
                 drag_event.acceptProposedAction()
@@ -129,10 +135,19 @@ class VideoTimeClipper(QMainWindow):
         self.pending_start_ms: Optional[int] = None
         self.pending_end_ms: Optional[int] = None
         self._slider_is_pressed = False
+        self._auto_play_requested = False
+        self._qt_media_started = False
+        self._fallback_active = False
+        self._fallback_playing = False
+        self._fallback_capture = None
+        self._fallback_fps = 30.0
+        self._fallback_position_ms = 0
 
-        self.player = QMediaPlayer(self)
+        self.player = QMediaPlayer(self, QMediaPlayer.VideoSurface)
         self.video_widget = QVideoWidget(self)
         self.player.setVideoOutput(self.video_widget)
+        self.fallback_timer = QTimer(self)
+        self.fallback_timer.timeout.connect(self._render_fallback_frame)
 
         self.drop_filter = VideoDropFilter(self)
         self.drop_filter.dropped.connect(self.open_video)
@@ -162,7 +177,23 @@ class VideoTimeClipper(QMainWindow):
         self.video_widget.setAcceptDrops(True)
         self.video_widget.installEventFilter(self.drop_filter)
         self.video_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        player_layout.addWidget(self.video_widget, stretch=1)
+
+        self.frame_label = QLabel("拖曳影片到這裡")
+        self.frame_label.setObjectName("videoSurface")
+        self.frame_label.setAlignment(Qt.AlignCenter)
+        self.frame_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.frame_label.setAcceptDrops(True)
+        self.frame_label.installEventFilter(self.drop_filter)
+
+        self.video_stack_host = QWidget(self)
+        self.video_stack_host.setObjectName("videoSurface")
+        self.video_stack_host.setAcceptDrops(True)
+        self.video_stack_host.installEventFilter(self.drop_filter)
+        self.video_stack = QStackedLayout(self.video_stack_host)
+        self.video_stack.setContentsMargins(0, 0, 0, 0)
+        self.video_stack.addWidget(self.video_widget)
+        self.video_stack.addWidget(self.frame_label)
+        player_layout.addWidget(self.video_stack_host, stretch=1)
 
         controls = QFrame(self)
         controls.setObjectName("controls")
@@ -307,6 +338,12 @@ class VideoTimeClipper(QMainWindow):
             return
         super().dragEnterEvent(event)
 
+    def dragMoveEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802 - Qt override name
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
     def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802 - Qt override name
         for url in event.mimeData().urls():
             if url.isLocalFile():
@@ -330,12 +367,13 @@ class VideoTimeClipper(QMainWindow):
         self.player.durationChanged.connect(self.on_duration_changed)
         self.player.positionChanged.connect(self.on_position_changed)
         self.player.stateChanged.connect(self.on_state_changed)
+        self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.player.error.connect(self.on_player_error)
 
         self.seek_slider.sliderPressed.connect(self._on_slider_pressed)
         self.seek_slider.sliderReleased.connect(self._on_slider_released)
-        self.seek_slider.sliderMoved.connect(self.player.setPosition)
-        self.seek_slider.clickedValue.connect(self.player.setPosition)
+        self.seek_slider.sliderMoved.connect(self.set_player_position)
+        self.seek_slider.clickedValue.connect(self.set_player_position)
         self.segment_list.itemSelectionChanged.connect(self.update_actions)
         self.segment_list.itemDoubleClicked.connect(self.seek_to_segment_start)
 
@@ -358,10 +396,13 @@ class VideoTimeClipper(QMainWindow):
                 border: 1px solid #273247;
                 border-radius: 8px;
             }
-            QVideoWidget#videoSurface {
+            QWidget#videoSurface, QVideoWidget#videoSurface, QLabel#videoSurface {
                 background: #05070d;
                 border-top-left-radius: 8px;
                 border-top-right-radius: 8px;
+                color: #64748b;
+                font-size: 18px;
+                font-weight: 700;
             }
             QFrame#controls {
                 background: #101827;
@@ -489,15 +530,22 @@ class VideoTimeClipper(QMainWindow):
             QMessageBox.warning(self, "無法開啟", "找不到影片檔案。")
             return
 
+        self._stop_fallback_playback()
+        self.player.stop()
         self.video_path = os.path.abspath(path)
         self.pending_start_ms = None
         self.pending_end_ms = None
         self.segment_list.clear()
         self.duration_ms = 0
+        self._fallback_position_ms = 0
+        self._auto_play_requested = True
+        self._qt_media_started = False
+        self.video_stack.setCurrentWidget(self.video_widget)
+        self.frame_label.setText("正在載入影片...")
 
         self.player.setMedia(QMediaContent(QUrl.fromLocalFile(self.video_path)))
         self.file_label.setText(self.video_path)
-        self.status_label.setText("影片已載入")
+        self.status_label.setText("正在載入影片，載入完成會自動播放")
         self.play_button.setEnabled(True)
         self.rewind_button.setEnabled(True)
         self.forward_button.setEnabled(True)
@@ -509,10 +557,155 @@ class VideoTimeClipper(QMainWindow):
         self._refresh_capture_labels()
         self.update_actions()
 
-        QTimer.singleShot(80, self.player.play)
+        QTimer.singleShot(0, self._request_qt_play)
+        QTimer.singleShot(450, self._request_qt_play)
+        QTimer.singleShot(1400, self._request_qt_play)
+        QTimer.singleShot(2200, self._fallback_if_qt_stalled)
+
+    def current_position_ms(self) -> int:
+        if self._fallback_active:
+            return int(self._fallback_position_ms)
+        return int(self.player.position())
+
+    def set_player_position(self, position_ms: int) -> None:
+        upper_bound = self.duration_ms if self.duration_ms > 0 else max(position_ms, 0)
+        position_ms = max(0, min(int(position_ms), upper_bound))
+        if self._fallback_active:
+            self._seek_fallback(position_ms)
+            return
+        self.player.setPosition(position_ms)
+
+    def _request_qt_play(self) -> None:
+        if not self.video_path or self._fallback_active:
+            return
+        self.player.play()
+
+    def _fallback_if_qt_stalled(self) -> None:
+        if not self.video_path or self._fallback_active:
+            return
+        if self.player.state() == QMediaPlayer.PlayingState and self.player.duration() > 0:
+            return
+        self._start_fallback_playback("Qt 播放器尚未開始，已切換相容播放模式")
+
+    def _start_fallback_playback(self, reason: str) -> None:
+        if self._fallback_active or not self.video_path:
+            return
+        if cv2 is None:
+            self.status_label.setText(f"{reason}，但目前 Python 沒有 OpenCV 可用。")
+            return
+
+        capture = cv2.VideoCapture(self.video_path)
+        if not capture.isOpened():
+            self.status_label.setText(f"{reason}，但相容模式也無法開啟這支影片。")
+            return
+
+        self.player.stop()
+        self.video_stack.setCurrentWidget(self.frame_label)
+        self._fallback_capture = capture
+        self._fallback_active = True
+        self._fallback_playing = True
+        self._fallback_position_ms = 0
+
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0)
+        if fps <= 1 or fps > 240:
+            fps = 30.0
+        self._fallback_fps = fps
+
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if frame_count > 0 and self.duration_ms <= 0:
+            self.duration_ms = int((frame_count / fps) * 1000)
+            self.seek_slider.setRange(0, self.duration_ms)
+            self.total_time_label.setText(format_time(self.duration_ms))
+
+        self.status_label.setText(f"{reason}（此模式重點是畫面與時間擷取，音訊由 Qt 後端支援時才有）")
+        self._set_play_button_state(is_playing=True)
+        self._render_fallback_frame()
+        interval_ms = max(15, min(80, int(1000 / self._fallback_fps)))
+        self.fallback_timer.start(interval_ms)
+
+    def _stop_fallback_playback(self) -> None:
+        self.fallback_timer.stop()
+        if self._fallback_capture is not None:
+            self._fallback_capture.release()
+        self._fallback_capture = None
+        self._fallback_active = False
+        self._fallback_playing = False
+        self.frame_label.clear()
+        self.frame_label.setText("拖曳影片到這裡")
+
+    def _pause_fallback_playback(self) -> None:
+        self.fallback_timer.stop()
+        self._fallback_playing = False
+        self._set_play_button_state(is_playing=False)
+
+    def _resume_fallback_playback(self) -> None:
+        if not self._fallback_capture:
+            return
+        self._fallback_playing = True
+        self._set_play_button_state(is_playing=True)
+        interval_ms = max(15, min(80, int(1000 / self._fallback_fps)))
+        self.fallback_timer.start(interval_ms)
+
+    def _seek_fallback(self, position_ms: int) -> None:
+        if not self._fallback_capture:
+            return
+        was_playing = self._fallback_playing
+        self.fallback_timer.stop()
+        self._fallback_capture.set(cv2.CAP_PROP_POS_MSEC, position_ms)
+        self._fallback_position_ms = position_ms
+        self._render_fallback_frame()
+        if was_playing:
+            interval_ms = max(15, min(80, int(1000 / self._fallback_fps)))
+            self.fallback_timer.start(interval_ms)
+
+    def _render_fallback_frame(self) -> None:
+        if not self._fallback_capture:
+            return
+        ok, frame = self._fallback_capture.read()
+        if not ok:
+            self._pause_fallback_playback()
+            self.status_label.setText("影片播放到結尾")
+            return
+
+        position_ms = int(self._fallback_capture.get(cv2.CAP_PROP_POS_MSEC) or 0)
+        if position_ms <= 0:
+            frame_index = float(self._fallback_capture.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+            position_ms = int((frame_index / self._fallback_fps) * 1000)
+        self._fallback_position_ms = max(0, position_ms)
+        self._show_fallback_frame(frame)
+        self._update_position_labels(self._fallback_position_ms)
+
+    def _show_fallback_frame(self, frame) -> None:
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width, channels = rgb_frame.shape
+        bytes_per_line = channels * width
+        image = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(image)
+        if not self.frame_label.size().isEmpty():
+            pixmap = pixmap.scaled(self.frame_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.frame_label.setPixmap(pixmap)
+
+    def _update_position_labels(self, position_ms: int) -> None:
+        if not self._slider_is_pressed:
+            self.seek_slider.setValue(position_ms)
+        self.current_time_label.setText(format_time(position_ms))
+
+    def _set_play_button_state(self, is_playing: bool) -> None:
+        if is_playing:
+            self.play_button.setText("暫停")
+            self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+        else:
+            self.play_button.setText("播放")
+            self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
 
     def toggle_playback(self) -> None:
         if not self.video_path:
+            return
+        if self._fallback_active:
+            if self._fallback_playing:
+                self._pause_fallback_playback()
+            else:
+                self._resume_fallback_playback()
             return
         if self.player.state() == QMediaPlayer.PlayingState:
             self.player.pause()
@@ -522,13 +715,13 @@ class VideoTimeClipper(QMainWindow):
     def seek_relative(self, delta_ms: int) -> None:
         if not self.video_path:
             return
-        new_position = max(0, min(self.duration_ms, self.player.position() + delta_ms))
-        self.player.setPosition(new_position)
+        new_position = max(0, min(self.duration_ms, self.current_position_ms() + delta_ms))
+        self.set_player_position(new_position)
 
     def capture_start(self) -> None:
         if not self.video_path:
             return
-        self.pending_start_ms = self.player.position()
+        self.pending_start_ms = self.current_position_ms()
         self._refresh_capture_labels()
         self.status_label.setText(f"開始時間：{format_time(self.pending_start_ms)}")
         self.update_actions()
@@ -536,7 +729,7 @@ class VideoTimeClipper(QMainWindow):
     def capture_end(self) -> None:
         if not self.video_path:
             return
-        self.pending_end_ms = self.player.position()
+        self.pending_end_ms = self.current_position_ms()
         self._refresh_capture_labels()
         self.status_label.setText(f"結束時間：{format_time(self.pending_end_ms)}")
         self.update_actions()
@@ -570,7 +763,7 @@ class VideoTimeClipper(QMainWindow):
     def seek_to_segment_start(self, item: QListWidgetItem) -> None:
         segment = item.data(Qt.UserRole)
         if isinstance(segment, ClipSegment):
-            self.player.setPosition(segment.normalized().start_ms)
+            self.set_player_position(segment.normalized().start_ms)
 
     def copy_output(self) -> None:
         if not self.video_path:
@@ -604,29 +797,61 @@ class VideoTimeClipper(QMainWindow):
 
     def _on_slider_released(self) -> None:
         self._slider_is_pressed = False
-        self.player.setPosition(self.seek_slider.value())
+        self.set_player_position(self.seek_slider.value())
 
     def on_duration_changed(self, duration: int) -> None:
+        if self._fallback_active:
+            return
         self.duration_ms = max(0, duration)
         self.seek_slider.setRange(0, self.duration_ms)
         self.total_time_label.setText(format_time(self.duration_ms))
 
     def on_position_changed(self, position: int) -> None:
-        if not self._slider_is_pressed:
-            self.seek_slider.setValue(position)
-        self.current_time_label.setText(format_time(position))
+        if self._fallback_active:
+            return
+        self._update_position_labels(position)
 
     def on_state_changed(self, state: QMediaPlayer.State) -> None:
+        if self._fallback_active:
+            return
         if state == QMediaPlayer.PlayingState:
-            self.play_button.setText("暫停")
-            self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+            self._qt_media_started = True
+            self._auto_play_requested = False
+            self.status_label.setText("正在播放")
+            self._set_play_button_state(is_playing=True)
         else:
-            self.play_button.setText("播放")
-            self.play_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+            self._set_play_button_state(is_playing=False)
+
+    def on_media_status_changed(self, status: QMediaPlayer.MediaStatus) -> None:
+        if self._fallback_active:
+            return
+        if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
+            if self.player.duration() > 0 and self.duration_ms <= 0:
+                self.on_duration_changed(self.player.duration())
+            self.status_label.setText("影片已載入，正在開始播放")
+            if self._auto_play_requested:
+                self._request_qt_play()
+        elif status == QMediaPlayer.LoadingMedia:
+            self.status_label.setText("正在載入影片，載入完成會自動播放")
+        elif status == QMediaPlayer.StalledMedia:
+            self.status_label.setText("影片載入暫停，正在嘗試相容播放")
+            self._start_fallback_playback("Qt 播放器載入暫停")
+        elif status == QMediaPlayer.InvalidMedia:
+            self._start_fallback_playback("Qt 播放器無法讀取此影片")
 
     def on_player_error(self) -> None:
         error_text = self.player.errorString() or "播放時發生錯誤。"
-        self.status_label.setText(error_text)
+        if self._fallback_active:
+            return
+        if self.video_path and not self._fallback_active:
+            self._start_fallback_playback(f"Qt 播放器錯誤：{error_text}")
+        else:
+            self.status_label.setText(error_text)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override name
+        self._stop_fallback_playback()
+        self.player.stop()
+        super().closeEvent(event)
 
     def update_actions(self) -> None:
         has_video = bool(self.video_path)
