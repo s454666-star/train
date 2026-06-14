@@ -1498,27 +1498,46 @@ class VideoTimeClipper(QMainWindow):
             self.status_label.setText(f"{reason}（VLC 硬體播放器）")
             self._apply_vlc_crop()
             if player.play() == -1:
-                self._stop_vlc_playback()
+                self._stop_vlc_playback(release_async=True)
                 return False
             self.vlc_timer.start(100)
             QTimer.singleShot(250, self._sync_vlc_position)
             return True
         except Exception as exc:
-            self._stop_vlc_playback()
+            self._stop_vlc_playback(release_async=True)
             self.status_label.setText(f"VLC 播放器啟動失敗，改用備援：{exc}")
             return False
 
-    def _stop_vlc_playback(self) -> None:
+    def _stop_vlc_playback(self, release_async: bool = True) -> None:
         self.vlc_timer.stop()
-        if self._vlc_player is not None:
-            try:
-                self._vlc_player.stop()
-                self._vlc_player.release()
-            except Exception:
-                pass
+        player = self._vlc_player
         self._vlc_player = None
         self._vlc_active = False
         self._vlc_playing = False
+        self._vlc_terminal_seek_retry_active = False
+        self._vlc_terminal_seek_retry_ms = None
+        if player is None:
+            return
+        if release_async:
+            threading.Thread(
+                target=self._release_vlc_player,
+                args=(player,),
+                name="VideoTimeClipperVlcRelease",
+                daemon=True,
+            ).start()
+            return
+        self._release_vlc_player(player)
+
+    @staticmethod
+    def _release_vlc_player(player) -> None:
+        try:
+            player.stop()
+        except Exception:
+            pass
+        try:
+            player.release()
+        except Exception:
+            pass
 
     def _pause_vlc_playback(self) -> None:
         if not self._vlc_player:
@@ -1540,7 +1559,6 @@ class VideoTimeClipper(QMainWindow):
                 if self.duration_ms > 0 and target_ms >= self.duration_ms - 500:
                     target_ms = 0
                 self._vlc_player.play()
-                QApplication.processEvents()
                 self._vlc_player.set_time(max(0, min(target_ms, self.duration_ms)))
             except Exception:
                 return
@@ -1565,7 +1583,6 @@ class VideoTimeClipper(QMainWindow):
             should_pause_after_seek = True
             try:
                 self._vlc_player.play()
-                QApplication.processEvents()
             except Exception:
                 pass
 
