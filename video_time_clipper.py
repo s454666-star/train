@@ -845,6 +845,10 @@ class VideoTimeClipper(QMainWindow):
         self._mpv_playing = False
         self._mpv_ack_count = 0
         self._mpv_last_command_error = ""
+        self._mpv_state_lock = threading.RLock()
+        self._mpv_reported_position_ms: Optional[int] = None
+        self._mpv_reported_pause: Optional[bool] = None
+        self._mpv_last_state_query_at = 0.0
 
         self.fallback_timer = QTimer(self)
         self.fallback_timer.timeout.connect(self._render_fallback_frame)
@@ -1467,8 +1471,12 @@ class VideoTimeClipper(QMainWindow):
 
     def _pause_for_slider_scan(self) -> None:
         if self._mpv_active:
+            if self._mpv_playing:
+                self._pause_mpv_playback()
             return
         if self._vlc_active:
+            if self._vlc_playing:
+                self._pause_vlc_playback()
             return
         elif self._fallback_active:
             self._pause_fallback_playback()
@@ -1596,6 +1604,10 @@ class VideoTimeClipper(QMainWindow):
         self._mpv_ipc_stop = threading.Event()
         self._mpv_ack_count = 0
         self._mpv_last_command_error = ""
+        self._mpv_last_state_query_at = 0.0
+        with self._mpv_state_lock:
+            self._mpv_reported_position_ms = 0
+            self._mpv_reported_pause = False
         args = [
             mpv_path,
             "--no-config",
@@ -1730,13 +1742,18 @@ class VideoTimeClipper(QMainWindow):
         try:
             while not stop_event.is_set():
                 try:
-                    command = command_queue.get(timeout=0.1)
+                    queue_item = command_queue.get(timeout=0.1)
                 except queue.Empty:
                     if process.poll() is not None:
                         return
                     continue
-                if command is None:
+                if queue_item is None:
                     return
+                if isinstance(queue_item, tuple):
+                    command, response_tag = queue_item
+                else:
+                    command = queue_item
+                    response_tag = None
                 request_id += 1
                 message = json.dumps({"command": command, "request_id": request_id}) + "\n"
                 try:
@@ -1757,6 +1774,8 @@ class VideoTimeClipper(QMainWindow):
                     if response.get("request_id") == request_id:
                         self._mpv_ack_count += 1
                         self._mpv_last_command_error = str(response.get("error", ""))
+                        if response_tag:
+                            self._handle_mpv_response(response_tag, response)
                         break
         finally:
             with self._mpv_ipc_lock:
@@ -1767,14 +1786,42 @@ class VideoTimeClipper(QMainWindow):
             except Exception:
                 pass
 
-    def _send_mpv_command(self, command: list) -> bool:
+    def _handle_mpv_response(self, response_tag: str, response: dict) -> None:
+        if response.get("error") != "success":
+            return
+        if response_tag == "time-pos":
+            data = response.get("data")
+            if data is None:
+                return
+            try:
+                position_ms = int(float(data) * 1000)
+            except (TypeError, ValueError):
+                return
+            if self.duration_ms > 0:
+                position_ms = max(0, min(position_ms, self.duration_ms))
+            with self._mpv_state_lock:
+                self._mpv_reported_position_ms = position_ms
+            return
+        if response_tag == "pause":
+            with self._mpv_state_lock:
+                self._mpv_reported_pause = bool(response.get("data"))
+
+    def _send_mpv_command(self, command: list, response_tag: Optional[str] = None) -> bool:
         if not self._mpv_active:
             return False
         try:
-            self._mpv_command_queue.put_nowait(command)
+            self._mpv_command_queue.put_nowait((command, response_tag))
             return True
         except Exception:
             return False
+
+    def _queue_mpv_state_query(self) -> None:
+        now = time.perf_counter()
+        if now - self._mpv_last_state_query_at < 0.25:
+            return
+        self._mpv_last_state_query_at = now
+        self._send_mpv_command(["get_property", "time-pos"], response_tag="time-pos")
+        self._send_mpv_command(["get_property", "pause"], response_tag="pause")
 
     def _pause_mpv_playback(self) -> None:
         if not self._mpv_active:
@@ -1782,6 +1829,8 @@ class VideoTimeClipper(QMainWindow):
         self._fallback_position_ms = self._playback_target_position_ms()
         self._send_mpv_command(["cycle", "pause"])
         self._mpv_playing = False
+        with self._mpv_state_lock:
+            self._mpv_reported_pause = True
         self._sync_playback_clock()
         self._set_play_button_state(is_playing=False)
 
@@ -1792,6 +1841,8 @@ class VideoTimeClipper(QMainWindow):
             self._seek_mpv(0, refresh_thumbnails=False)
         self._send_mpv_command(["cycle", "pause"])
         self._mpv_playing = True
+        with self._mpv_state_lock:
+            self._mpv_reported_pause = False
         self._sync_playback_clock()
         self._set_play_button_state(is_playing=True)
 
@@ -1802,6 +1853,9 @@ class VideoTimeClipper(QMainWindow):
         position_ms = max(0, min(int(position_ms), upper_bound))
         self._send_mpv_command(["seek", position_ms / 1000, "absolute+exact"])
         self._fallback_position_ms = position_ms
+        with self._mpv_state_lock:
+            self._mpv_reported_position_ms = position_ms
+        self._mpv_last_state_query_at = 0.0
         self._sync_playback_clock()
         self._update_position_labels(position_ms)
         if refresh_thumbnails:
@@ -1818,6 +1872,29 @@ class VideoTimeClipper(QMainWindow):
             self._set_play_button_state(is_playing=False)
             if not ended_near_duration:
                 self.status_label.setText("mpv 播放程序已結束，GUI 仍可繼續使用")
+            return
+        self._queue_mpv_state_query()
+        with self._mpv_state_lock:
+            reported_position_ms = self._mpv_reported_position_ms
+            reported_pause = self._mpv_reported_pause
+        if reported_pause is not None:
+            actual_playing = not reported_pause
+            if self._mpv_playing != actual_playing:
+                self._mpv_playing = actual_playing
+                self._set_play_button_state(is_playing=actual_playing)
+                self._sync_playback_clock()
+        if reported_position_ms is not None:
+            position_ms = reported_position_ms
+            if self.duration_ms > 0:
+                position_ms = min(position_ms, self.duration_ms)
+            self._fallback_position_ms = position_ms
+            self._playback_clock_position_ms = position_ms
+            if self._mpv_playing:
+                self._playback_clock_started_at = time.perf_counter()
+            self._update_position_labels(position_ms)
+            if self.duration_ms > 0 and position_ms >= self.duration_ms - 250:
+                self._mpv_playing = False
+                self._set_play_button_state(is_playing=False)
             return
         if self._mpv_playing:
             position_ms = self._playback_target_position_ms()
@@ -2274,6 +2351,7 @@ class VideoTimeClipper(QMainWindow):
         self.thumbnail_strip.set_range(self.pending_start_ms, self.pending_end_ms)
         self._schedule_thumbnail_refresh(self.pending_start_ms)
         self.status_label.setText(f"[ 左邊開頭：{format_time(self.pending_start_ms)}")
+        self._pause_when_capture_range_ready()
         self.update_actions()
 
     def capture_end(self) -> None:
@@ -2284,7 +2362,22 @@ class VideoTimeClipper(QMainWindow):
         self.thumbnail_strip.set_range(self.pending_start_ms, self.pending_end_ms)
         self._schedule_thumbnail_refresh(self.pending_end_ms)
         self.status_label.setText(f"] 右邊結尾：{format_time(self.pending_end_ms)}")
+        self._pause_when_capture_range_ready()
         self.update_actions()
+
+    def _pause_when_capture_range_ready(self) -> None:
+        if self.pending_start_ms is None or self.pending_end_ms is None:
+            return
+        if self._mpv_active:
+            if self._mpv_playing:
+                self._pause_mpv_playback()
+            return
+        if self._vlc_active:
+            if self._vlc_playing:
+                self._pause_vlc_playback()
+            return
+        if self._fallback_active and self._fallback_playing:
+            self._pause_fallback_playback()
 
     def add_segment(self) -> None:
         if self.pending_start_ms is None or self.pending_end_ms is None:
@@ -2415,7 +2508,7 @@ class VideoTimeClipper(QMainWindow):
 
     def _on_slider_pressed(self) -> None:
         self._slider_is_pressed = True
-        self._resume_after_slider = self._is_currently_playing()
+        self._resume_after_slider = self._mpv_active or self._vlc_active or self._fallback_active
         self._pause_for_slider_scan()
 
     def _set_slider_value_without_feedback(self, slider_value: int) -> None:
