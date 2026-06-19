@@ -2407,6 +2407,15 @@ class VideoTimeClipper(QMainWindow):
         self.segment_list.clear()
         self.update_actions()
 
+    def _clear_exported_ranges(self) -> None:
+        self.segment_list.clear()
+        self.pending_start_ms = None
+        self.pending_end_ms = None
+        self._refresh_capture_labels()
+        self.thumbnail_strip.set_range(None, None)
+        self._schedule_thumbnail_preview()
+        self.update_actions()
+
     def seek_to_segment_start(self, item: QListWidgetItem) -> None:
         segment = item.data(Qt.UserRole)
         if isinstance(segment, ClipSegment):
@@ -2437,8 +2446,8 @@ class VideoTimeClipper(QMainWindow):
             QMessageBox.warning(self, "寫入失敗", f"無法寫入檔案：\n{target_path}\n\n{exc}")
             return
 
-        self.status_label.setText(f"已寫入：{target_path}")
-        self.output_preview.setText(output)
+        self._clear_exported_ranges()
+        self.status_label.setText(f"已寫入並清空區間：{target_path}")
 
     def _prepare_output_text(self) -> str:
         if not self.video_path:
