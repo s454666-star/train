@@ -2,7 +2,7 @@ import os
 import sys
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_PYTHON_DIR = r"C:\www\blog\python"
+REPO_PYTHON_DIR = r"C:\Users\Star\Documents\GitHub\blog\python"
 
 if REPO_PYTHON_DIR not in sys.path:
     sys.path.insert(0, REPO_PYTHON_DIR)

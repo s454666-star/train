@@ -9,6 +9,8 @@ $ErrorActionPreference = 'Stop'
 
 $baseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pythonExe = Join-Path $baseDir 'venv\Scripts\python.exe'
+$pythonwExe = Join-Path $baseDir 'venv\Scripts\pythonw.exe'
+$watchdogLog = Join-Path $baseDir 'logs\telegram_services_watchdog.log'
 $stdoutLog = Join-Path $baseDir ("logs\telegram_service_{0}.stdout.log" -f $Port)
 $stderrLog = Join-Path $baseDir ("logs\telegram_service_{0}.stderr.log" -f $Port)
 
@@ -18,7 +20,11 @@ function Test-PortListening {
     )
 
     try {
-        return [bool](Get-NetTCPConnection -LocalPort $TargetPort -State Listen -ErrorAction Stop)
+        $response = Invoke-RestMethod `
+            -Uri ("http://127.0.0.1:{0}/bots/health" -f $TargetPort) `
+            -Method Get `
+            -TimeoutSec 2
+        return [string]$response.status -eq 'ok'
     } catch {
         return $false
     }
@@ -27,7 +33,7 @@ function Test-PortListening {
 function Wait-ForTcpPort {
     param(
         [int]$TargetPort,
-        [int]$TimeoutSeconds = 20
+        [int]$TimeoutSeconds = 90
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -54,10 +60,12 @@ if (Test-PortListening -TargetPort $Port) {
     exit 0
 }
 
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $stdoutLog) | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $watchdogLog) | Out-Null
+
+$servicePython = if (Test-Path -LiteralPath $pythonwExe) { $pythonwExe } else { $pythonExe }
 
 $process = Start-Process `
-    -FilePath $pythonExe `
+    -FilePath $servicePython `
     -ArgumentList @('-m', 'uvicorn', "$ModuleName`:app", '--host', '0.0.0.0', '--port', [string]$Port) `
     -WorkingDirectory $baseDir `
     -RedirectStandardOutput $stdoutLog `
@@ -73,3 +81,8 @@ if (-not (Wait-ForTcpPort -TargetPort $Port)) {
 
     throw "Telegram FastAPI module $ModuleName did not open port $Port."
 }
+
+Add-Content `
+    -LiteralPath $watchdogLog `
+    -Value ("{0} healthy module={1} port={2} pid={3}" -f (Get-Date -Format o), $ModuleName, $Port, $process.Id) `
+    -Encoding UTF8

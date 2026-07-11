@@ -54,16 +54,25 @@ if (-not (Test-Path -LiteralPath $pythonExe)) {
     throw "Python executable not found: $pythonExe"
 }
 
+if (-not $IdmPath) {
+    $IdmPath = @(
+        'C:\Program Files (x86)\Internet Download Manager\IDMan.exe',
+        'C:\Program Files\Internet Download Manager\IDMan.exe'
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+}
+
+# The Telegram API does not depend on the optional local IDM bridge.
+if (-not $IdmPath) {
+    exit 0
+}
+
 if (Test-HelperHealthy -TargetHost $HelperHost -TargetPort $Port) {
     exit 0
 }
 
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $stdoutLog) | Out-Null
 
-$argumentList = @($helperScript, '--host', $HelperHost, '--port', [string]$Port)
-if ($IdmPath) {
-    $argumentList += @('--idm-path', $IdmPath)
-}
+$argumentList = @($helperScript, '--host', $HelperHost, '--port', [string]$Port, '--idm-path', $IdmPath)
 
 if (Test-Path -LiteralPath $pythonwExe) {
     $process = Start-Process `

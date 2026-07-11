@@ -1,35 +1,74 @@
+[CmdletBinding()]
+param(
+    [string]$TaskName = 'Telegram FastAPI Services',
+    [string]$RunnerPath = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'Codex\local-tools\windows-hidden-runner\Run-Hidden.vbs')
+)
+
 $ErrorActionPreference = 'Stop'
 
 $baseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$servicesLauncher = Join-Path $baseDir 'start_telegram_services.vbs'
-$startupDir = [Environment]::GetFolderPath('Startup')
-$startupLauncher = Join-Path $startupDir 'Train Telegram Services Startup.vbs'
+$currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$launcher = Join-Path $baseDir 'start_telegram_services.ps1'
+$powershellExe = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$wscriptExe = Join-Path $env:WINDIR 'System32\wscript.exe'
 
-if (-not (Test-Path -LiteralPath $servicesLauncher)) {
-    throw "Services launcher not found: $servicesLauncher"
+foreach ($requiredPath in @($launcher, $RunnerPath, $powershellExe, $wscriptExe)) {
+    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+        throw "Required launcher file not found: $requiredPath"
+    }
 }
 
-$startupContent = @"
-Option Explicit
+function ConvertTo-RunnerToken {
+    param([AllowNull()][string]$Value)
 
-Dim shell
-Dim command
+    if ([string]::IsNullOrEmpty($Value)) {
+        return '-'
+    }
 
-command = "wscript.exe ""$servicesLauncher"""
-
-Set shell = CreateObject("WScript.Shell")
-shell.Run command, 0, False
-"@
-
-[System.IO.File]::WriteAllText($startupLauncher, $startupContent, [System.Text.Encoding]::ASCII)
-Write-Host "Startup launcher written: $startupLauncher"
-
-$watchdogTaskName = 'Telegram FastAPI Services'
-try {
-    $null = Get-ScheduledTask -TaskName $watchdogTaskName -ErrorAction Stop
-    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument ('"{0}"' -f $servicesLauncher)
-    Set-ScheduledTask -TaskName $watchdogTaskName -Action $action | Out-Null
-    Write-Host "Watchdog task updated: $watchdogTaskName"
-} catch {
-    Write-Warning ("Unable to update watchdog task {0}: {1}" -f $watchdogTaskName, $_.Exception.Message)
+    return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Value))
 }
+
+$powershellArguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $launcher
+$runnerArguments = '//B //Nologo "{0}" {1} {2} {3}' -f $RunnerPath, (
+    ConvertTo-RunnerToken $powershellExe), (
+    ConvertTo-RunnerToken $powershellArguments), (
+    ConvertTo-RunnerToken $baseDir)
+
+$action = New-ScheduledTaskAction `
+    -Execute $wscriptExe `
+    -Argument $runnerArguments `
+    -WorkingDirectory (Split-Path -Parent $RunnerPath)
+
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
+$watchdogTrigger = New-ScheduledTaskTrigger `
+    -Once `
+    -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1) `
+    -RepetitionDuration (New-TimeSpan -Days 3650)
+
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+    -MultipleInstances IgnoreNew
+
+$principal = New-ScheduledTaskPrincipal `
+    -UserId $currentUser `
+    -LogonType Interactive `
+    -RunLevel Limited
+
+Register-ScheduledTask `
+    -TaskName $TaskName `
+    -Action $action `
+    -Trigger @($logonTrigger, $watchdogTrigger) `
+    -Settings $settings `
+    -Principal $principal `
+    -Description 'Keeps Telegram FastAPI ports 8001-8003 online without a console window.' `
+    -Force `
+    -ErrorAction Stop | Out-Null
+
+Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop

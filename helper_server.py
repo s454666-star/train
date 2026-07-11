@@ -74,7 +74,7 @@ def find_idm_path(cli_value):
         return cli_value
 
     candidates = [
-        r"C:\Program Files (x86)\Internet Download Manager1\IDMan.exe",
+        r"C:\Program Files (x86)\Internet Download Manager\IDMan.exe",
         r"C:\Program Files\Internet Download Manager\IDMan.exe",
     ]
     for candidate in candidates:
