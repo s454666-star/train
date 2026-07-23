@@ -55,6 +55,10 @@ APP_LOG_PATH = os.path.join(LOG_DIR, "face_extractor_runtime.log")
 FAULT_LOG_PATH = os.path.join(LOG_DIR, "face_extractor_faulthandler.log")
 VIDEO_ROOT = os.path.abspath(os.environ.get("VIDEO_ROOT", r"E:\video"))
 RETRY_VIDEO_ROOT = os.path.abspath(os.environ.get("RETRY_VIDEO_ROOT", r"H:\video(重跑)"))
+VIDEO_FEATURE_VERSION = "v2"
+BLACK_BORDER_BRIGHTNESS_THRESHOLD = 16
+BLACK_BORDER_MAX_BRIGHT_PIXEL_RATIO = 0.02
+BLACK_BORDER_MIN_REMAINING_RATIO = 0.50
 
 _FAULT_FP = None
 
@@ -123,6 +127,10 @@ DB_CONNECTION_ERROR_NUMBERS = {2002, 2003, 2006, 2013, 2014, 2045, 2055}
 
 
 class DatabaseReconnectFailed(RuntimeError):
+    pass
+
+
+class RequiredVideoFeatureError(RuntimeError):
     pass
 
 
@@ -618,6 +626,32 @@ class FaceExtractorApp:
             except Exception as err:
                 print(f"移除輸出目錄失敗: {created_dir}, 錯誤: {err}")
 
+    def rollback_incomplete_video_master(self, video_master_id: Optional[int]) -> None:
+        if not video_master_id:
+            return
+
+        self.clear_existing_video_features(video_master_id)
+        self.db_execute_commit(
+            """
+                DELETE vfs
+                FROM video_face_screenshots vfs
+                INNER JOIN video_screenshots vs ON vs.id = vfs.video_screenshot_id
+                WHERE vs.video_master_id = %s
+            """,
+            (video_master_id,),
+            "刪除未完成主檔的人臉截圖",
+        )
+        self.db_execute_commit(
+            "DELETE FROM video_screenshots WHERE video_master_id = %s",
+            (video_master_id,),
+            "刪除未完成主檔的截圖",
+        )
+        self.db_execute_commit(
+            "DELETE FROM video_master WHERE id = %s",
+            (video_master_id,),
+            "刪除未完成影片主檔",
+        )
+
     def build_output_video_name(self, output_dir: str, original_video_path: str) -> str:
         output_base_name = os.path.basename(os.path.abspath(output_dir))
         original_ext = os.path.splitext(original_video_path)[1].lower() or ".mp4"
@@ -671,7 +705,10 @@ class FaceExtractorApp:
 
     def compute_dhash_hex(self, image_path: str) -> str:
         with Image.open(image_path) as img:
-            resized = img.convert("RGB").resize((9, 8), Image.BILINEAR)
+            hash_source = self.crop_near_black_borders(img.convert("RGB"))
+            # GD imagecopyresampled() behaves like an area/box reduction at
+            # this scale. BOX keeps Python hashes byte-identical to Laravel.
+            resized = hash_source.resize((9, 8), Image.Resampling.BOX)
             pixels = list(resized.getdata())
 
         bytes_out = [0] * 8
@@ -695,16 +732,83 @@ class FaceExtractorApp:
 
         return "".join(f"{byte & 255:02x}" for byte in bytes_out)
 
+    def crop_near_black_borders(self, image: Image.Image) -> Image.Image:
+        width, height = image.size
+        if width <= 1 or height <= 1:
+            return image
+
+        pixels = image.load()
+
+        def mostly_black(samples: List[Tuple[int, int, int]]) -> bool:
+            if not samples:
+                return False
+            brightness = [max(int(r), int(g), int(b)) for r, g, b in samples]
+            bright_count = sum(
+                1 for value in brightness
+                if value > BLACK_BORDER_BRIGHTNESS_THRESHOLD
+            )
+            return (
+                (bright_count / len(brightness)) <= BLACK_BORDER_MAX_BRIGHT_PIXEL_RATIO
+                and (sum(brightness) / len(brightness)) <= BLACK_BORDER_BRIGHTNESS_THRESHOLD
+            )
+
+        column_step = max(1, height // 200)
+
+        def column_is_black(x: int) -> bool:
+            return mostly_black([
+                pixels[x, y]
+                for y in range(0, height, column_step)
+            ])
+
+        left = 0
+        while left < width - 1 and column_is_black(left):
+            left += 1
+
+        right = width - 1
+        while right > left and column_is_black(right):
+            right -= 1
+
+        row_step = max(1, max(1, right - left + 1) // 200)
+
+        def row_is_black(y: int) -> bool:
+            return mostly_black([
+                pixels[x, y]
+                for x in range(left, right + 1, row_step)
+            ])
+
+        top = 0
+        while top < height - 1 and row_is_black(top):
+            top += 1
+
+        bottom = height - 1
+        while bottom > top and row_is_black(bottom):
+            bottom -= 1
+
+        if left == 0 and right == width - 1 and top == 0 and bottom == height - 1:
+            return image
+
+        crop_width = right - left + 1
+        crop_height = bottom - top + 1
+        if (
+            crop_width < int(math.floor(width * BLACK_BORDER_MIN_REMAINING_RATIO))
+            or crop_height < int(math.floor(height * BLACK_BORDER_MIN_REMAINING_RATIO))
+        ):
+            return image
+
+        return image.crop((left, top, right + 1, bottom + 1))
+
     def probe_video_duration(self, video_path: str) -> float:
         ffprobe_bin = _resolve_media_tool("FFPROBE_BIN", "ffprobe")
         command = [
             ffprobe_bin,
             "-v",
             "error",
+            "-select_streams",
+            "v:0",
             "-show_entries",
-            "format=duration",
+            "stream=duration:format=duration",
             "-of",
-            "default=nokey=1:noprint_wrappers=1",
+            "json",
             video_path,
         ]
 
@@ -731,8 +835,13 @@ class FaceExtractorApp:
             raise RuntimeError("ffprobe 未回傳有效的 duration")
 
         try:
-            duration = float(output)
-        except ValueError as err:
+            payload = json.loads(output)
+            streams = payload.get("streams") or []
+            stream_duration = streams[0].get("duration") if streams else None
+            format_duration = (payload.get("format") or {}).get("duration")
+            raw_duration = stream_duration if stream_duration not in (None, "", "N/A") else format_duration
+            duration = float(raw_duration)
+        except (AttributeError, IndexError, TypeError, ValueError, json.JSONDecodeError) as err:
             raise RuntimeError("ffprobe 未回傳有效的 duration") from err
 
         return max(duration, 0.0)
@@ -1009,7 +1118,7 @@ class FaceExtractorApp:
                 None,
                 None,
                 0,
-                "v1",
+                VIDEO_FEATURE_VERSION,
                 "10s_x4",
                 message[:65535],
             ),
@@ -1110,7 +1219,7 @@ class FaceExtractorApp:
                     file_created_at,
                     file_modified_at,
                     len(capture_plan),
-                    "v1",
+                    VIDEO_FEATURE_VERSION,
                     capture_rule,
                 ),
                 "寫入影片特徵",
@@ -1370,7 +1479,16 @@ class FaceExtractorApp:
             _flush_logs()
         except Exception:
             pass
-        files = filedialog.askopenfilenames(title="選擇影片", filetypes=[("影片檔案", "*.mp4;*.avi;*.mov;*.mkv")])
+        files = filedialog.askopenfilenames(
+            title="選擇影片",
+            filetypes=[
+                (
+                    "影片檔案",
+                    "*.mp4;*.avi;*.mov;*.mkv;*.wmv;*.flv;*.webm;"
+                    "*.m4v;*.mpeg;*.mpg;*.3gp;*.ts;*.mts;*.m2ts",
+                )
+            ],
+        )
         for file in files:
             abs_file = os.path.abspath(file)
             if abs_file not in self.video_list:
@@ -1723,6 +1841,9 @@ class FaceExtractorApp:
                             raise
                         print(f"建立影片特徵資料時發生錯誤: {feature_err}")
                         traceback.print_exc()
+                        raise RequiredVideoFeatureError(
+                            f"影片特徵為必要資料，建立失敗：{feature_err}"
+                        ) from feature_err
 
                     retry_dir = RETRY_VIDEO_ROOT
                     self.ensure_dir(retry_dir)
@@ -1734,7 +1855,7 @@ class FaceExtractorApp:
                     eagle_result = self.import_video_to_eagle_retry_library(destination_path, output_video_name)
                     print(f"已匯入 Eagle 重跑資源: {eagle_result}")
                 except Exception as e:
-                    if isinstance(e, (DatabaseReconnectFailed, mysql.connector.Error)):
+                    if isinstance(e, (DatabaseReconnectFailed, RequiredVideoFeatureError, mysql.connector.Error)):
                         raise
                     try:
                         LOGGER.exception("移動影片檔案發生錯誤: %s", e)
@@ -1772,6 +1893,16 @@ class FaceExtractorApp:
                     cap.release()
                 except Exception:
                     pass
+                if isinstance(e, RequiredVideoFeatureError):
+                    try:
+                        self.rollback_incomplete_video_master(video_master_id)
+                    except Exception as rollback_err:
+                        LOGGER.exception("清除未完成影片主檔失敗: %s", rollback_err)
+                    self.rollback_video_files(rollback_state, str(e))
+                    self.is_running = False
+                    aborted_by_db_failure = True
+                    self._update_current_file(f"特徵建立失敗，已回朔：{video_name}")
+                    break
                 self.remove_processed_video(self.current_index)
 
         try:
