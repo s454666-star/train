@@ -8,6 +8,9 @@ mysql-connector-python==8.1.0
 Pillow==10.0.0
 numpy==1.26.4
 python-dotenv==1.0.1
+customtkinter==5.2.2
+mtcnn==0.1.1
+setuptools<81
 
 diffusers==0.14.0
 transformers==4.30.0

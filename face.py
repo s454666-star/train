@@ -19,6 +19,7 @@ from mtcnn import MTCNN
 import re
 import traceback
 import shutil
+import glob
 import json
 import hashlib
 import mysql.connector
@@ -52,8 +53,36 @@ except Exception:
 LOG_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
 APP_LOG_PATH = os.path.join(LOG_DIR, "face_extractor_runtime.log")
 FAULT_LOG_PATH = os.path.join(LOG_DIR, "face_extractor_faulthandler.log")
+VIDEO_ROOT = os.path.abspath(os.environ.get("VIDEO_ROOT", r"E:\video"))
+RETRY_VIDEO_ROOT = os.path.abspath(os.environ.get("RETRY_VIDEO_ROOT", r"H:\video(重跑)"))
 
 _FAULT_FP = None
+
+
+def _resolve_media_tool(env_name: str, executable_name: str) -> str:
+    configured = os.environ.get(env_name)
+    if configured:
+        return configured
+
+    resolved = shutil.which(executable_name)
+    if resolved:
+        return resolved
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    package_pattern = os.path.join(
+        local_app_data,
+        "Microsoft",
+        "WinGet",
+        "Packages",
+        "Gyan.FFmpeg_*",
+        "**",
+        f"{executable_name}.exe",
+    )
+    candidates = glob.glob(package_pattern, recursive=True)
+    if candidates:
+        return candidates[0]
+
+    return executable_name
 
 
 def _configure_logger() -> logging.Logger:
@@ -295,17 +324,6 @@ class FaceExtractorApp:
         if detector is not None:
             return detector
 
-    def _reset_mtcnn_detector(self) -> None:
-        try:
-            if hasattr(self, "_mtcnn_local") and getattr(self._mtcnn_local, "detector", None) is not None:
-                try:
-                    delattr(self._mtcnn_local, "detector")
-                except Exception:
-                    self._mtcnn_local.detector = None
-        except Exception:
-            pass
-
-
         try:
             LOGGER.info("建立 MTCNN detector（thread=%s）", threading.current_thread().name)
             _flush_logs()
@@ -315,6 +333,16 @@ class FaceExtractorApp:
         detector = MTCNN()
         self._mtcnn_local.detector = detector
         return detector
+
+    def _reset_mtcnn_detector(self) -> None:
+        try:
+            if hasattr(self, "_mtcnn_local") and getattr(self._mtcnn_local, "detector", None) is not None:
+                try:
+                    delattr(self._mtcnn_local, "detector")
+                except Exception:
+                    self._mtcnn_local.detector = None
+        except Exception:
+            pass
 
     def _prepare_for_detection(self, image: np.ndarray) -> Tuple[np.ndarray, float]:
         try:
@@ -668,7 +696,7 @@ class FaceExtractorApp:
         return "".join(f"{byte & 255:02x}" for byte in bytes_out)
 
     def probe_video_duration(self, video_path: str) -> float:
-        ffprobe_bin = os.environ.get("FFPROBE_BIN", "ffprobe")
+        ffprobe_bin = _resolve_media_tool("FFPROBE_BIN", "ffprobe")
         command = [
             ffprobe_bin,
             "-v",
@@ -681,7 +709,14 @@ class FaceExtractorApp:
         ]
 
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
         except FileNotFoundError as err:
             raise RuntimeError(f"ffprobe 不存在：{ffprobe_bin}") from err
         except subprocess.TimeoutExpired as err:
@@ -709,7 +744,7 @@ class FaceExtractorApp:
         output_path: str,
         excluded_capture_second_keys: Optional[Set[str]] = None,
     ) -> float:
-        ffmpeg_bin = os.environ.get("FFMPEG_BIN", "ffmpeg")
+        ffmpeg_bin = _resolve_media_tool("FFMPEG_BIN", "ffmpeg")
         failure_messages: List[str] = []
         excluded_capture_second_keys = excluded_capture_second_keys or set()
 
@@ -760,7 +795,14 @@ class FaceExtractorApp:
         )
 
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=180)
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
         except FileNotFoundError as err:
             raise RuntimeError(f"ffmpeg 不存在：{ffmpeg_bin}") from err
         except subprocess.TimeoutExpired as err:
@@ -884,7 +926,7 @@ class FaceExtractorApp:
         for screenshot_id, screenshot_path in rows:
             if screenshot_path:
                 normalized_screenshot_path = self.normalize_db_relative_path(str(screenshot_path)).replace("/", os.sep)
-                screenshot_abs_path = os.path.abspath(os.path.join(r"D:\video", normalized_screenshot_path))
+                screenshot_abs_path = os.path.abspath(os.path.join(VIDEO_ROOT, normalized_screenshot_path))
                 if os.path.exists(screenshot_abs_path):
                     try:
                         os.remove(screenshot_abs_path)
@@ -1343,13 +1385,13 @@ class FaceExtractorApp:
         except Exception:
             pass
         """
-        只掃描 D:\\video 底下（不遞迴）的 .mp4 檔案：
-        - 直接使用 os.listdir("D:\\video")
+        只掃描 VIDEO_ROOT 底下（預設 E:\\video，不遞迴）的 .mp4 檔案：
+        - 直接使用 os.listdir(VIDEO_ROOT)
         - 僅加入檔案且副檔名為 .mp4（大小寫不拘）
         - 不掃描任何子資料夾的內容（因為處理過的檔案會被搬入子資料夾）
         - 不跳出任何 alert，結果顯示在下方標籤
         """
-        root_dir = r"D:\video"
+        root_dir = VIDEO_ROOT
         if not os.path.exists(root_dir):
             msg = f"掃描失敗：路徑不存在 {root_dir}"
             print(msg)
@@ -1682,12 +1724,12 @@ class FaceExtractorApp:
                         print(f"建立影片特徵資料時發生錯誤: {feature_err}")
                         traceback.print_exc()
 
-                    retry_dir = os.path.abspath(r"Z:\video(重跑)")
+                    retry_dir = RETRY_VIDEO_ROOT
                     self.ensure_dir(retry_dir)
                     retry_copy_path = os.path.abspath(os.path.join(retry_dir, output_video_name))
                     shutil.copy2(destination_path, retry_copy_path)
                     rollback_state["retry_copy_path"] = retry_copy_path
-                    print(f"已複製影片檔案至 Z:\\video(重跑): {retry_copy_path}")
+                    print(f"已複製影片檔案至 {retry_dir}: {retry_copy_path}")
 
                     eagle_result = self.import_video_to_eagle_retry_library(destination_path, output_video_name)
                     print(f"已匯入 Eagle 重跑資源: {eagle_result}")
