@@ -5,6 +5,8 @@ cd /d "%~dp0"
 set "FACE_PYTHON=%~dp0.venv\Scripts\python.exe"
 set "FACE_SCRIPT=%~dp0face.py"
 set "TUNNEL_SCRIPT=%USERPROFILE%\.codex\skills\aws-sky\scripts\ensure_db_tunnel.ps1"
+set "BLOG_ARTISAN=%USERPROFILE%\Documents\project\blog\artisan"
+set "VIDEO_INDEX_ROOT=E:\video"
 
 if not exist "%FACE_PYTHON%" (
     echo ERROR: Project Python was not found:
@@ -28,6 +30,17 @@ if exist "%TUNNEL_SCRIPT%" (
         echo WARNING: The AWS database tunnel could not be started.
         echo face.py will open, but database operations may fail.
     )
+)
+
+if exist "%BLOG_ARTISAN%" (
+    php "%BLOG_ARTISAN%" video:repair-physical-indexes --video-root="%VIDEO_INDEX_ROOT%" --apply
+    if errorlevel 1 (
+        echo WARNING: Physical video DB index repair failed.
+        echo face.py will open, but check the repair output above.
+    )
+) else (
+    echo WARNING: Blog artisan was not found. Skipping physical video DB index repair:
+    echo %BLOG_ARTISAN%
 )
 
 "%FACE_PYTHON%" "%FACE_SCRIPT%"
