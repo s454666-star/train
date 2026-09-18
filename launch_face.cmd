@@ -7,6 +7,7 @@ set "FACE_SCRIPT=%~dp0face.py"
 set "TUNNEL_SCRIPT=%USERPROFILE%\.codex\skills\aws-sky\scripts\ensure_db_tunnel.ps1"
 set "BLOG_ARTISAN=%USERPROFILE%\Documents\project\blog\artisan"
 set "VIDEO_INDEX_ROOT=E:\video"
+set "RETRY_VIDEO_ROOT=M:\video(重跑)"
 
 if not exist "%FACE_PYTHON%" (
     echo ERROR: Project Python was not found:
